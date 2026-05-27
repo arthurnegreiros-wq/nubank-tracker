@@ -538,12 +538,14 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
 
     st.divider()
     st.subheader("Transações")
-    st.info("✏️ Clique em qualquer célula da coluna **Categoria** para alterá-la direto na tabela.", icon="💡")
     busca = st.text_input("🔍 Buscar", placeholder="ex: uber, ifood, farmácia...")
 
     tbl = view[["uid", "data", "valor", "descricao", "categoria", "tipo"]].sort_values("data", ascending=False).reset_index(drop=True)
     if busca:
         tbl = tbl[tbl["descricao"].str.contains(busca, case=False, na=False)].reset_index(drop=True)
+
+    _A = " ▾"
+    user_cats_a = [c + _A for c in user_cats]
 
     uid_index        = tbl["uid"].copy()
     tbl["data"]      = tbl["data"].dt.strftime("%d/%m/%Y")
@@ -552,6 +554,7 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
     tbl["sel"]       = False
     tbl = tbl.rename(columns={"sel": "✓", "data": "Data", "valor": "Valor",
                                "descricao": "Descrição", "categoria": "Categoria", "tipo": "Tipo"})
+    tbl["Categoria"] = tbl["Categoria"] + _A
 
     cat_orig = tbl["Categoria"].reset_index(drop=True)
 
@@ -564,18 +567,19 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
             "Tipo":      st.column_config.Column(disabled=True, width="small"),
             "Descrição": st.column_config.Column(disabled=True),
             "Categoria": st.column_config.SelectboxColumn(
-                "Categoria ✏️", options=user_cats, required=True,
+                "Categoria", options=user_cats_a, required=True,
             ),
         },
         hide_index=True, use_container_width=True, key="tx_editor",
     )
 
-    # Mudanças inline na coluna Categoria salvam automaticamente
-    cat_edited = edited["Categoria"].reset_index(drop=True)
+    # Detecta mudanças e salva removendo o ▾ antes de gravar
+    cat_edited = edited["Categoria"].str.replace(_A, "", regex=False).reset_index(drop=True)
+    cat_orig_clean = cat_orig.str.replace(_A, "", regex=False).reset_index(drop=True)
     inline_changes = [
         (uid_index.iloc[i], cat_edited.iloc[i])
         for i in range(len(cat_edited))
-        if cat_edited.iloc[i] != cat_orig.iloc[i]
+        if cat_edited.iloc[i] != cat_orig_clean.iloc[i]
     ]
     if inline_changes:
         save_categorias(inline_changes, usuario)
@@ -600,7 +604,7 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
             fetch_data.clear()
             st.rerun()
     else:
-        st.caption("Clique na categoria para mudar direto. Marque ✓ para ignorar várias de uma vez.")
+        st.caption("Marque ✓ para ignorar várias de uma vez.")
 
     if has_historico(usuario):
         if st.button("↩️ Desfazer última alteração de categorias"):
@@ -626,7 +630,7 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
             ignoradas_tbl["Valor"]    = ignoradas_tbl["valor"].map(brl)
             ignoradas_tbl["Descrição"] = ignoradas_tbl["descricao"].map(extract_merchant)
 
-            ignoradas_tbl["Categoria"] = "Ignorar"
+            ignoradas_tbl["Categoria"] = "Ignorar" + _A
             ign_cat_orig = ignoradas_tbl["Categoria"].reset_index(drop=True)
 
             ign_edited = st.data_editor(
@@ -637,17 +641,18 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
                     "Valor":     st.column_config.Column(disabled=True),
                     "Descrição": st.column_config.Column(disabled=True),
                     "Categoria": st.column_config.SelectboxColumn(
-                        "Mover para ✏️", options=user_cats, required=True,
+                        "Mover para", options=user_cats_a, required=True,
                     ),
                 },
                 hide_index=True, use_container_width=True, key="ign_editor",
             )
 
-            ign_cat_edited = ign_edited["Categoria"].reset_index(drop=True)
+            ign_cat_edited = ign_edited["Categoria"].str.replace(_A, "", regex=False).reset_index(drop=True)
+            ign_cat_orig_clean = ign_cat_orig.str.replace(_A, "", regex=False).reset_index(drop=True)
             ign_inline = [
                 (ign_uid_index.iloc[i], ign_cat_edited.iloc[i])
                 for i in range(len(ign_cat_edited))
-                if ign_cat_edited.iloc[i] != ign_cat_orig.iloc[i]
+                if ign_cat_edited.iloc[i] != ign_cat_orig_clean.iloc[i]
             ]
             if ign_inline:
                 save_categorias(ign_inline, usuario)
