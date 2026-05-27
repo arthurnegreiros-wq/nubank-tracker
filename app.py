@@ -552,6 +552,8 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
     tbl = tbl.rename(columns={"sel": "✓", "data": "Data", "valor": "Valor",
                                "descricao": "Descrição", "categoria": "Categoria", "tipo": "Tipo"})
 
+    cat_orig = tbl["Categoria"].reset_index(drop=True)
+
     edited = st.data_editor(
         tbl[["✓", "Data", "Valor", "Tipo", "Descrição", "Categoria"]],
         column_config={
@@ -560,31 +562,44 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
             "Valor":     st.column_config.Column(disabled=True),
             "Tipo":      st.column_config.Column(disabled=True, width="small"),
             "Descrição": st.column_config.Column(disabled=True),
-            "Categoria": st.column_config.Column(disabled=True),
+            "Categoria": st.column_config.SelectboxColumn(
+                "Categoria", options=user_cats, required=True,
+            ),
         },
         hide_index=True, use_container_width=True, key="tx_editor",
     )
+
+    # Mudanças inline na coluna Categoria salvam automaticamente
+    cat_edited = edited["Categoria"].reset_index(drop=True)
+    inline_changes = [
+        (uid_index.iloc[i], cat_edited.iloc[i])
+        for i in range(len(cat_edited))
+        if cat_edited.iloc[i] != cat_orig.iloc[i]
+    ]
+    if inline_changes:
+        save_categorias(inline_changes, usuario)
+        fetch_data.clear()
+        st.rerun()
 
     selecionados = uid_index[edited[edited["✓"] == True].index].tolist()
     n = len(selecionados)
 
     if n > 0:
-        st.info(f"**{n} transação(ões) selecionada(s)** — escolha uma ação abaixo:")
-        a1, a2, a3 = st.columns([3, 1, 1])
+        st.info(f"**{n} transação(ões) selecionada(s)** — ignorar em lote:")
+        a1, a2 = st.columns([3, 1])
         with a1:
-            cat_acao = st.selectbox("Definir categoria", user_cats, key="bulk_cat")
+            cat_acao = st.selectbox("Ou definir categoria para todas", user_cats, key="bulk_cat")
         with a2:
-            if st.button("✅ Aplicar categoria", use_container_width=True):
+            if st.button("✅ Aplicar", use_container_width=True):
                 save_categorias([(uid, cat_acao) for uid in selecionados], usuario)
                 fetch_data.clear()
                 st.rerun()
-        with a3:
-            if st.button("🚫 Ignorar selecionados", use_container_width=True):
-                save_categorias([(uid, "Ignorar") for uid in selecionados], usuario)
-                fetch_data.clear()
-                st.rerun()
+        if st.button("🚫 Ignorar selecionadas", use_container_width=True):
+            save_categorias([(uid, "Ignorar") for uid in selecionados], usuario)
+            fetch_data.clear()
+            st.rerun()
     else:
-        st.caption("Marque ✓ em uma ou mais transações para aplicar uma ação em lote.")
+        st.caption("Clique na categoria para mudar direto. Marque ✓ para ignorar várias de uma vez.")
 
     if has_historico(usuario):
         if st.button("↩️ Desfazer última alteração de categorias"):
@@ -610,31 +625,43 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
             ignoradas_tbl["Valor"]    = ignoradas_tbl["valor"].map(brl)
             ignoradas_tbl["Descrição"] = ignoradas_tbl["descricao"].map(extract_merchant)
 
+            ignoradas_tbl["Categoria"] = "Ignorar"
+            ign_cat_orig = ignoradas_tbl["Categoria"].reset_index(drop=True)
+
             ign_edited = st.data_editor(
-                ignoradas_tbl[["✓", "Data", "Valor", "Descrição"]],
+                ignoradas_tbl[["✓", "Data", "Valor", "Descrição", "Categoria"]],
                 column_config={
                     "✓":         st.column_config.CheckboxColumn("✓", width="small"),
                     "Data":      st.column_config.Column(disabled=True),
                     "Valor":     st.column_config.Column(disabled=True),
                     "Descrição": st.column_config.Column(disabled=True),
+                    "Categoria": st.column_config.SelectboxColumn(
+                        "Mover para", options=user_cats, required=True,
+                    ),
                 },
                 hide_index=True, use_container_width=True, key="ign_editor",
             )
 
-            ign_selecionados = ign_uid_index[ign_edited[ign_edited["✓"] == True].index].tolist()
+            ign_cat_edited = ign_edited["Categoria"].reset_index(drop=True)
+            ign_inline = [
+                (ign_uid_index.iloc[i], ign_cat_edited.iloc[i])
+                for i in range(len(ign_cat_edited))
+                if ign_cat_edited.iloc[i] != ign_cat_orig.iloc[i]
+            ]
+            if ign_inline:
+                save_categorias(ign_inline, usuario)
+                fetch_data.clear()
+                st.rerun()
 
+            ign_selecionados = ign_uid_index[ign_edited[ign_edited["✓"] == True].index].tolist()
             if ign_selecionados:
-                b1, b2 = st.columns([3, 1])
-                with b1:
-                    cat_ign = st.selectbox("Mover para categoria", user_cats, key="ign_cat_sel",
-                                           index=user_cats.index("Não categorizado") if "Não categorizado" in user_cats else 0)
-                with b2:
-                    if st.button("✅ Restaurar selecionadas", use_container_width=True, key="btn_restaurar_ign"):
-                        save_categorias([(uid, cat_ign) for uid in ign_selecionados], usuario)
-                        fetch_data.clear()
-                        st.rerun()
+                if st.button(f"🗑️ Remover {len(ign_selecionados)} do Ignorar → Não categorizado",
+                             use_container_width=True, key="btn_restaurar_ign"):
+                    save_categorias([(uid, "Não categorizado") for uid in ign_selecionados], usuario)
+                    fetch_data.clear()
+                    st.rerun()
             else:
-                st.caption("Marque ✓ nas transações que quer tirar do Ignorar.")
+                st.caption("Clique na coluna 'Mover para' para escolher a categoria, ou marque ✓ para restaurar várias de uma vez.")
 
 # ── Orçamento ─────────────────────────────────────────────────────────────────
 def render_orcamento(df_all: pd.DataFrame, usuario: str, user_cats: list):
