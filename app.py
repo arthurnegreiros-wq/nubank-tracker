@@ -49,6 +49,7 @@ def db_df(sql: str, params: dict = None) -> pd.DataFrame:
         cols = list(result.keys())
     return pd.DataFrame(rows, columns=cols)
 
+@st.cache_resource
 def db_init():
     with get_engine().begin() as conn:
         conn.execute(text("""
@@ -111,6 +112,7 @@ def create_user(nome: str, pin: str):
     )
 
 # ── Rules per user ────────────────────────────────────────────────────────────
+@st.cache_data
 def load_rules(usuario: str) -> dict:
     rows, _ = db_exec(
         "SELECT valor FROM preferencias WHERE usuario=:u AND chave='regras'",
@@ -123,13 +125,16 @@ def save_rules(rules: dict, usuario: str):
         INSERT INTO preferencias (usuario, chave, valor) VALUES (:u, 'regras', :v)
         ON CONFLICT (usuario, chave) DO UPDATE SET valor=EXCLUDED.valor
     """, {"u": usuario, "v": json.dumps(rules, ensure_ascii=False)})
+    load_rules.clear()
 
 def backup_rules(rules: dict, usuario: str):
     db_exec("""
         INSERT INTO preferencias (usuario, chave, valor) VALUES (:u, 'regras_backup', :v)
         ON CONFLICT (usuario, chave) DO UPDATE SET valor=EXCLUDED.valor
     """, {"u": usuario, "v": json.dumps(rules, ensure_ascii=False)})
+    has_rules_backup.clear()
 
+@st.cache_data
 def has_rules_backup(usuario: str) -> bool:
     rows, _ = db_exec(
         "SELECT 1 FROM preferencias WHERE usuario=:u AND chave='regras_backup'",
@@ -149,7 +154,14 @@ def undo_rules(usuario: str) -> bool:
         ON CONFLICT (usuario, chave) DO UPDATE SET valor=EXCLUDED.valor
     """, {"u": usuario, "v": rows[0][0]})
     db_exec("DELETE FROM preferencias WHERE usuario=:u AND chave='regras_backup'", {"u": usuario})
+    load_rules.clear()
+    has_rules_backup.clear()
     return True
+
+@st.cache_data
+def has_historico(usuario: str) -> bool:
+    rows, _ = db_exec("SELECT 1 FROM historico WHERE usuario=:u LIMIT 1", {"u": usuario}, fetch=True)
+    return bool(rows)
 
 # ── Fetch (cached) ────────────────────────────────────────────────────────────
 @st.cache_data
@@ -252,6 +264,7 @@ def save_categorias(changes: list, usuario: str):
                 text("UPDATE transacoes SET categoria=:cat WHERE uid=:uid AND usuario=:u"),
                 {"cat": nova_cat, "uid": uid, "u": usuario}
             )
+    has_historico.clear()
 
 def undo_last_tx(usuario: str) -> int:
     with get_engine().begin() as conn:
@@ -275,6 +288,7 @@ def undo_last_tx(usuario: str) -> int:
             text("DELETE FROM historico WHERE evento_id=:eid AND usuario=:u"),
             {"eid": evento_id, "u": usuario}
         )
+    has_historico.clear()
     return len(changes)
 
 def delete_categoria_completa(cat_name: str, rules: dict, usuario: str) -> int:
@@ -572,8 +586,7 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
     else:
         st.caption("Marque ✓ em uma ou mais transações para aplicar uma ação em lote.")
 
-    rows_h, _ = db_exec("SELECT 1 FROM historico WHERE usuario=:u LIMIT 1", {"u": usuario}, fetch=True)
-    if rows_h:
+    if has_historico(usuario):
         if st.button("↩️ Desfazer última alteração de categorias"):
             n_revert = undo_last_tx(usuario)
             fetch_data.clear()
