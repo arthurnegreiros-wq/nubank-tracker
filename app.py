@@ -538,6 +538,7 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
 
     st.divider()
     st.subheader("Transações")
+    st.info("✏️ Clique em qualquer célula da coluna **Categoria** para alterá-la direto na tabela.", icon="💡")
     busca = st.text_input("🔍 Buscar", placeholder="ex: uber, ifood, farmácia...")
 
     tbl = view[["uid", "data", "valor", "descricao", "categoria", "tipo"]].sort_values("data", ascending=False).reset_index(drop=True)
@@ -563,7 +564,7 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
             "Tipo":      st.column_config.Column(disabled=True, width="small"),
             "Descrição": st.column_config.Column(disabled=True),
             "Categoria": st.column_config.SelectboxColumn(
-                "Categoria", options=user_cats, required=True,
+                "Categoria ✏️", options=user_cats, required=True,
             ),
         },
         hide_index=True, use_container_width=True, key="tx_editor",
@@ -636,7 +637,7 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
                     "Valor":     st.column_config.Column(disabled=True),
                     "Descrição": st.column_config.Column(disabled=True),
                     "Categoria": st.column_config.SelectboxColumn(
-                        "Mover para", options=user_cats, required=True,
+                        "Mover para ✏️", options=user_cats, required=True,
                     ),
                 },
                 hide_index=True, use_container_width=True, key="ign_editor",
