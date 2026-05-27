@@ -1,0 +1,6 @@
+nubank.db
+*.json
+__pycache__/
+*.pyc
+.env
+.streamlit/secrets.toml
