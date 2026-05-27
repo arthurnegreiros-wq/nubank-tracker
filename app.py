@@ -544,9 +544,6 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
     if busca:
         tbl = tbl[tbl["descricao"].str.contains(busca, case=False, na=False)].reset_index(drop=True)
 
-    _A = " ▾"
-    user_cats_a = [c + _A for c in user_cats]
-
     uid_index        = tbl["uid"].copy()
     tbl["data"]      = tbl["data"].dt.strftime("%d/%m/%Y")
     tbl["valor"]     = tbl["valor"].map(brl)
@@ -554,32 +551,30 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
     tbl["sel"]       = False
     tbl = tbl.rename(columns={"sel": "✓", "data": "Data", "valor": "Valor",
                                "descricao": "Descrição", "categoria": "Categoria", "tipo": "Tipo"})
-    tbl["Categoria"] = tbl["Categoria"] + _A
-
-    cat_orig = tbl["Categoria"].reset_index(drop=True)
+    tbl["Categoria ✏️"] = tbl["Categoria"]
 
     edited = st.data_editor(
-        tbl[["✓", "Data", "Valor", "Tipo", "Descrição", "Categoria"]],
+        tbl[["✓", "Data", "Valor", "Tipo", "Descrição", "Categoria ✏️"]],
         column_config={
-            "✓":         st.column_config.CheckboxColumn("✓", width="small"),
-            "Data":      st.column_config.Column(disabled=True),
-            "Valor":     st.column_config.Column(disabled=True),
-            "Tipo":      st.column_config.Column(disabled=True, width="small"),
-            "Descrição": st.column_config.Column(disabled=True),
-            "Categoria": st.column_config.SelectboxColumn(
-                "Categoria", options=user_cats_a, required=True,
+            "✓":          st.column_config.CheckboxColumn("✓", width="small"),
+            "Data":       st.column_config.Column(disabled=True),
+            "Valor":      st.column_config.Column(disabled=True),
+            "Tipo":       st.column_config.Column(disabled=True, width="small"),
+            "Descrição":  st.column_config.Column(disabled=True),
+            "Categoria ✏️": st.column_config.SelectboxColumn(
+                "Categoria ✏️", options=user_cats, required=True,
             ),
         },
         hide_index=True, use_container_width=True, key="tx_editor",
     )
 
-    # Detecta mudanças e salva removendo o ▾ antes de gravar
-    cat_edited = edited["Categoria"].str.replace(_A, "", regex=False).reset_index(drop=True)
-    cat_orig_clean = cat_orig.str.replace(_A, "", regex=False).reset_index(drop=True)
+    # Mudanças inline salvam automaticamente
+    cat_orig   = tbl["Categoria ✏️"].reset_index(drop=True)
+    cat_edited = edited["Categoria ✏️"].reset_index(drop=True)
     inline_changes = [
         (uid_index.iloc[i], cat_edited.iloc[i])
         for i in range(len(cat_edited))
-        if cat_edited.iloc[i] != cat_orig_clean.iloc[i]
+        if cat_edited.iloc[i] != cat_orig.iloc[i]
     ]
     if inline_changes:
         save_categorias(inline_changes, usuario)
@@ -590,21 +585,22 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
     n = len(selecionados)
 
     if n > 0:
-        st.info(f"**{n} transação(ões) selecionada(s)** — ignorar em lote:")
-        a1, a2 = st.columns([3, 1])
+        st.info(f"**{n} transação(ões) selecionada(s)**")
+        a1, a2, a3 = st.columns([3, 1, 1])
         with a1:
-            cat_acao = st.selectbox("Ou definir categoria para todas", user_cats, key="bulk_cat")
+            cat_acao = st.selectbox("Definir categoria", user_cats, key="bulk_cat")
         with a2:
             if st.button("✅ Aplicar", use_container_width=True):
                 save_categorias([(uid, cat_acao) for uid in selecionados], usuario)
                 fetch_data.clear()
                 st.rerun()
-        if st.button("🚫 Ignorar selecionadas", use_container_width=True):
-            save_categorias([(uid, "Ignorar") for uid in selecionados], usuario)
-            fetch_data.clear()
-            st.rerun()
+        with a3:
+            if st.button("🚫 Ignorar", use_container_width=True):
+                save_categorias([(uid, "Ignorar") for uid in selecionados], usuario)
+                fetch_data.clear()
+                st.rerun()
     else:
-        st.caption("Marque ✓ para ignorar várias de uma vez.")
+        st.caption("Clique em **Categoria ✏️** para mudar direto, ou marque ✓ para alterar várias de uma vez.")
 
     if has_historico(usuario):
         if st.button("↩️ Desfazer última alteração de categorias"):
@@ -630,29 +626,28 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
             ignoradas_tbl["Valor"]    = ignoradas_tbl["valor"].map(brl)
             ignoradas_tbl["Descrição"] = ignoradas_tbl["descricao"].map(extract_merchant)
 
-            ignoradas_tbl["Categoria"] = "Ignorar" + _A
-            ign_cat_orig = ignoradas_tbl["Categoria"].reset_index(drop=True)
+            ignoradas_tbl["Mover para ✏️"] = "Ignorar"
+            ign_cat_orig = ignoradas_tbl["Mover para ✏️"].reset_index(drop=True)
 
             ign_edited = st.data_editor(
-                ignoradas_tbl[["✓", "Data", "Valor", "Descrição", "Categoria"]],
+                ignoradas_tbl[["✓", "Data", "Valor", "Descrição", "Mover para ✏️"]],
                 column_config={
-                    "✓":         st.column_config.CheckboxColumn("✓", width="small"),
-                    "Data":      st.column_config.Column(disabled=True),
-                    "Valor":     st.column_config.Column(disabled=True),
-                    "Descrição": st.column_config.Column(disabled=True),
-                    "Categoria": st.column_config.SelectboxColumn(
-                        "Mover para", options=user_cats_a, required=True,
+                    "✓":            st.column_config.CheckboxColumn("✓", width="small"),
+                    "Data":         st.column_config.Column(disabled=True),
+                    "Valor":        st.column_config.Column(disabled=True),
+                    "Descrição":    st.column_config.Column(disabled=True),
+                    "Mover para ✏️": st.column_config.SelectboxColumn(
+                        "Mover para ✏️", options=user_cats, required=True,
                     ),
                 },
                 hide_index=True, use_container_width=True, key="ign_editor",
             )
 
-            ign_cat_edited = ign_edited["Categoria"].str.replace(_A, "", regex=False).reset_index(drop=True)
-            ign_cat_orig_clean = ign_cat_orig.str.replace(_A, "", regex=False).reset_index(drop=True)
+            ign_cat_edited = ign_edited["Mover para ✏️"].reset_index(drop=True)
             ign_inline = [
                 (ign_uid_index.iloc[i], ign_cat_edited.iloc[i])
                 for i in range(len(ign_cat_edited))
-                if ign_cat_edited.iloc[i] != ign_cat_orig_clean.iloc[i]
+                if ign_cat_edited.iloc[i] != ign_cat_orig.iloc[i]
             ]
             if ign_inline:
                 save_categorias(ign_inline, usuario)
