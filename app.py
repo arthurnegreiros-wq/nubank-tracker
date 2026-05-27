@@ -593,6 +593,49 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
             st.success(f"{n_revert} transação(ões) revertida(s).")
             st.rerun()
 
+    ignoradas = df_all[
+        (df_all["data"].dt.to_period("M").astype(str) == periodo_sel) &
+        (df_all["categoria"] == "Ignorar")
+    ].copy()
+
+    if not ignoradas.empty:
+        st.divider()
+        with st.expander(f"🙈 Ignoradas neste período ({len(ignoradas)}) — clique para gerenciar"):
+            st.caption("Selecione as que quer restaurar e escolha uma categoria, ou restaure uma por vez.")
+
+            ignoradas_tbl = ignoradas.sort_values("data", ascending=False).reset_index(drop=True)
+            ign_uid_index = ignoradas_tbl["uid"].copy()
+            ignoradas_tbl["✓"]        = False
+            ignoradas_tbl["Data"]     = ignoradas_tbl["data"].dt.strftime("%d/%m/%Y")
+            ignoradas_tbl["Valor"]    = ignoradas_tbl["valor"].map(brl)
+            ignoradas_tbl["Descrição"] = ignoradas_tbl["descricao"].map(extract_merchant)
+
+            ign_edited = st.data_editor(
+                ignoradas_tbl[["✓", "Data", "Valor", "Descrição"]],
+                column_config={
+                    "✓":         st.column_config.CheckboxColumn("✓", width="small"),
+                    "Data":      st.column_config.Column(disabled=True),
+                    "Valor":     st.column_config.Column(disabled=True),
+                    "Descrição": st.column_config.Column(disabled=True),
+                },
+                hide_index=True, use_container_width=True, key="ign_editor",
+            )
+
+            ign_selecionados = ign_uid_index[ign_edited[ign_edited["✓"] == True].index].tolist()
+
+            if ign_selecionados:
+                b1, b2 = st.columns([3, 1])
+                with b1:
+                    cat_ign = st.selectbox("Mover para categoria", user_cats, key="ign_cat_sel",
+                                           index=user_cats.index("Não categorizado") if "Não categorizado" in user_cats else 0)
+                with b2:
+                    if st.button("✅ Restaurar selecionadas", use_container_width=True, key="btn_restaurar_ign"):
+                        save_categorias([(uid, cat_ign) for uid in ign_selecionados], usuario)
+                        fetch_data.clear()
+                        st.rerun()
+            else:
+                st.caption("Marque ✓ nas transações que quer tirar do Ignorar.")
+
 # ── Orçamento ─────────────────────────────────────────────────────────────────
 def render_orcamento(df_all: pd.DataFrame, usuario: str, user_cats: list):
     IGNORAR_CATS = {"Entrada", "Resgate RDB", "Fatura Cartão", "Investimento", "Ignorar"}
