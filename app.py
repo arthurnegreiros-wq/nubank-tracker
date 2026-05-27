@@ -885,8 +885,58 @@ def render_regras(rules: dict, usuario: str, user_cats: list):
                 st.warning("Categoria já existe.")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+def inject_mobile_css():
+    st.markdown("""
+    <style>
+    @media screen and (max-width: 640px) {
+        /* Empilha colunas verticalmente no celular */
+        div[data-testid="stHorizontalBlock"] {
+            flex-direction: column !important;
+        }
+        div[data-testid="column"] {
+            min-width: 100% !important;
+            flex: none !important;
+        }
+        /* Evita zoom automático em inputs no iOS */
+        input, textarea, select {
+            font-size: 16px !important;
+        }
+        /* Botões maiores para toque */
+        div[data-testid="stButton"] button {
+            width: 100% !important;
+            min-height: 2.75rem !important;
+        }
+        /* Tabelas com scroll horizontal */
+        div[data-testid="stDataEditorContainer"],
+        div[data-testid="stDataFrameContainer"] {
+            overflow-x: auto !important;
+        }
+        /* Tabs com scroll horizontal quando necessário */
+        div[data-testid="stTabs"] > div:first-child {
+            overflow-x: auto !important;
+            white-space: nowrap !important;
+        }
+        /* Menos padding nas bordas */
+        .main .block-container {
+            padding-left: 0.75rem !important;
+            padding-right: 0.75rem !important;
+        }
+        /* Radio buttons quebram linha se necessário */
+        div[data-testid="stRadio"] > div {
+            flex-wrap: wrap !important;
+            gap: 0.25rem !important;
+        }
+        /* Gráficos ocupam largura total */
+        div[data-testid="stPlotlyChart"] {
+            width: 100% !important;
+        }
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
 def main():
     db_init()
+    inject_mobile_css()
 
     if "usuario" not in st.session_state:
         render_login()
