@@ -1301,7 +1301,7 @@ def _gerar_excel(df_all: pd.DataFrame, mes: str) -> bytes:
             {"Categoria": "SALDO",          "Gasto (R$)": round(entradas + saidas, 2),     "% do total": ""},
         ])
         resumo = pd.concat([by_cat, rodape], ignore_index=True)
-        resumo.to_excel(writer, sheet_name=f"Resumo {fmt_mes(mes)}", index=False)
+        resumo.to_excel(writer, sheet_name=f"Resumo {fmt_mes(mes).replace('/', '-')}", index=False)
 
         # --- Aba 2: Transações ---
         tx = df_mes[["data", "descricao", "categoria", "valor"]].copy()
