@@ -74,8 +74,8 @@ def db_init():
         """))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS rendas (
-                nome TEXT, usuario TEXT, valor REAL,
-                PRIMARY KEY (nome, usuario)
+                nome TEXT, usuario TEXT, mes TEXT, valor REAL,
+                PRIMARY KEY (nome, usuario, mes)
             )
         """))
         conn.execute(text("""
@@ -91,6 +91,31 @@ def db_init():
                 PRIMARY KEY (usuario, chave)
             )
         """))
+
+def _migrar_rendas():
+    """Migração única: adiciona coluna mes em rendas (schema antigo sem mes)."""
+    try:
+        with get_engine().begin() as conn:
+            conn.execute(text("ALTER TABLE rendas ADD COLUMN IF NOT EXISTS mes TEXT DEFAULT ''"))
+        with get_engine().begin() as conn:
+            now_mes = datetime.now().strftime("%Y-%m")
+            conn.execute(text(
+                "UPDATE rendas SET mes = :m WHERE mes IS NULL OR mes = ''"
+            ), {"m": now_mes})
+        with get_engine().begin() as conn:
+            has_mes_pk = conn.execute(text("""
+                SELECT 1 FROM information_schema.key_column_usage
+                WHERE table_name='rendas' AND column_name='mes'
+                  AND constraint_name IN (
+                      SELECT constraint_name FROM information_schema.table_constraints
+                      WHERE table_name='rendas' AND constraint_type='PRIMARY KEY'
+                  )
+            """)).fetchone()
+            if not has_mes_pk:
+                conn.execute(text("ALTER TABLE rendas DROP CONSTRAINT IF EXISTS rendas_pkey"))
+                conn.execute(text("ALTER TABLE rendas ADD PRIMARY KEY (nome, usuario, mes)"))
+    except Exception:
+        pass
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 def hash_pin(pin: str) -> str:
@@ -178,14 +203,14 @@ def fetch_data(usuario: str) -> pd.DataFrame:
     return df
 
 @st.cache_data
-def fetch_rendas(usuario: str) -> pd.DataFrame:
+def fetch_rendas(usuario: str, mes: str) -> pd.DataFrame:
     rows, _ = db_exec(
-        "SELECT nome, valor FROM rendas WHERE usuario=:u ORDER BY nome",
-        {"u": usuario}, fetch=True
+        "SELECT nome, valor FROM rendas WHERE usuario=:u AND mes=:m ORDER BY nome",
+        {"u": usuario, "m": mes}, fetch=True
     )
     if rows:
         return pd.DataFrame(rows, columns=["Fonte de renda", "Valor (R$)"])
-    return pd.DataFrame([{"Fonte de renda": "Salário", "Valor (R$)": 0.0}])
+    return pd.DataFrame(columns=["Fonte de renda", "Valor (R$)"])
 
 @st.cache_data
 def fetch_orcamentos(mes: str, usuario: str) -> dict:
@@ -196,15 +221,15 @@ def fetch_orcamentos(mes: str, usuario: str) -> dict:
     return {r[0]: float(r[1]) for r in rows} if rows else {}
 
 # ── Write ─────────────────────────────────────────────────────────────────────
-def save_rendas(df: pd.DataFrame, usuario: str):
+def save_rendas(df: pd.DataFrame, usuario: str, mes: str):
     with get_engine().begin() as conn:
-        conn.execute(text("DELETE FROM rendas WHERE usuario=:u"), {"u": usuario})
+        conn.execute(text("DELETE FROM rendas WHERE usuario=:u AND mes=:m"), {"u": usuario, "m": mes})
         for _, row in df.iterrows():
             nome_val = row["Fonte de renda"]
             if pd.notna(nome_val) and str(nome_val).strip():
                 conn.execute(
-                    text("INSERT INTO rendas (nome, usuario, valor) VALUES (:n, :u, :v)"),
-                    {"n": str(nome_val).strip(), "u": usuario, "v": float(row["Valor (R$)"])}
+                    text("INSERT INTO rendas (nome, usuario, mes, valor) VALUES (:n, :u, :m, :v)"),
+                    {"n": str(nome_val).strip(), "u": usuario, "m": mes, "v": float(row["Valor (R$)"])}
                 )
 
 def save_orcamentos(values: dict, mes: str, usuario: str):
@@ -319,15 +344,16 @@ def delete_categoria_completa(cat_name: str, rules: dict, usuario: str) -> int:
 def delete_transaction(uid: str, usuario: str):
     db_exec("DELETE FROM transacoes WHERE uid=:uid AND usuario=:u", {"uid": uid, "u": usuario})
 
-def delete_renda(nome: str, usuario: str):
-    db_exec("DELETE FROM rendas WHERE nome=:n AND usuario=:u", {"n": nome, "u": usuario})
+def delete_renda(nome: str, usuario: str, mes: str):
+    db_exec("DELETE FROM rendas WHERE nome=:n AND usuario=:u AND mes=:m",
+            {"n": nome, "u": usuario, "m": mes})
     fetch_rendas.clear()
 
-def add_renda(nome: str, valor: float, usuario: str):
+def add_renda(nome: str, valor: float, usuario: str, mes: str):
     db_exec("""
-        INSERT INTO rendas (nome, usuario, valor) VALUES (:n, :u, :v)
-        ON CONFLICT (nome, usuario) DO UPDATE SET valor=EXCLUDED.valor
-    """, {"n": nome, "u": usuario, "v": valor})
+        INSERT INTO rendas (nome, usuario, mes, valor) VALUES (:n, :u, :m, :v)
+        ON CONFLICT (nome, usuario, mes) DO UPDATE SET valor=EXCLUDED.valor
+    """, {"n": nome, "u": usuario, "m": mes, "v": valor})
     fetch_rendas.clear()
 
 def delete_all_data(usuario: str):
@@ -774,21 +800,32 @@ def render_orcamento(df_all: pd.DataFrame, usuario: str, user_cats: list):
         st.info("📋 Planejamento futuro — nenhum gasto registrado ainda. Defina seu orçamento abaixo.")
 
     st.markdown("### 💵 Renda")
-    rendas_df = fetch_rendas(usuario)
+    rendas_df = fetch_rendas(usuario, mes_orc)
 
-    # Linha de cabeçalho
-    rh1, rh2, rh3 = st.columns([3, 2, 1])
-    rh1.markdown("**Fonte de renda**")
-    rh2.markdown("**Valor**")
-    rh3.markdown("")
-    for _, row in rendas_df.iterrows():
-        rc1, rc2, rc3 = st.columns([3, 2, 1])
-        rc1.write(str(row["Fonte de renda"]))
-        rc2.write(brl(float(row["Valor (R$)"])))
-        if rc3.button("🗑️", key=f"del_renda_{row['Fonte de renda']}", help="Excluir"):
-            delete_renda(str(row["Fonte de renda"]), usuario)
-            fetch_rendas.clear()
-            st.rerun()
+    if rendas_df.empty:
+        mes_ant_r = str(pd.Period(mes_orc, freq="M") - 1)
+        rendas_ant = fetch_rendas(usuario, mes_ant_r)
+        if not rendas_ant.empty:
+            if st.button(f"📋 Copiar rendas de {fmt_mes(mes_ant_r)} para este mês"):
+                for _, row in rendas_ant.iterrows():
+                    add_renda(str(row["Fonte de renda"]), float(row["Valor (R$)"]), usuario, mes_orc)
+                fetch_rendas.clear()
+                st.rerun()
+        else:
+            st.caption("Nenhuma renda cadastrada para este mês.")
+
+    if not rendas_df.empty:
+        rh1, rh2, rh3 = st.columns([3, 2, 1])
+        rh1.markdown("**Fonte de renda**")
+        rh2.markdown("**Valor**")
+        rh3.markdown("")
+        for _, row in rendas_df.iterrows():
+            rc1, rc2, rc3 = st.columns([3, 2, 1])
+            rc1.write(str(row["Fonte de renda"]))
+            rc2.write(brl(float(row["Valor (R$)"])))
+            if rc3.button("🗑️", key=f"del_renda_{mes_orc}_{row['Fonte de renda']}", help="Excluir"):
+                delete_renda(str(row["Fonte de renda"]), usuario, mes_orc)
+                st.rerun()
 
     with st.form("form_add_renda", clear_on_submit=True):
         st.markdown("**Adicionar renda**")
@@ -797,11 +834,10 @@ def render_orcamento(df_all: pd.DataFrame, usuario: str, user_cats: list):
         new_val_s = fa2.text_input("Valor R$", placeholder="0,00", label_visibility="collapsed")
         if fa3.form_submit_button("➕"):
             if new_nome.strip():
-                add_renda(new_nome.strip(), parse_brl_input(new_val_s), usuario)
-                fetch_rendas.clear()
+                add_renda(new_nome.strip(), parse_brl_input(new_val_s), usuario, mes_orc)
                 st.rerun()
 
-    total_renda = rendas_df["Valor (R$)"].sum()
+    total_renda = float(rendas_df["Valor (R$)"].sum()) if not rendas_df.empty else 0.0
 
     if "hidden_orc" not in st.session_state:
         st.session_state["hidden_orc"] = set()
@@ -1655,7 +1691,7 @@ def render_relatorio(df_all: pd.DataFrame, usuario: str):
     mes_sel   = col_ms.selectbox("📅 Mês", meses, format_func=fmt_mes, key="mes_relatorio")
 
     orcamentos = fetch_orcamentos(mes_sel, usuario)
-    rendas_df  = fetch_rendas(usuario)
+    rendas_df  = fetch_rendas(usuario, mes_sel)
     pdf_bytes  = _gerar_pdf(df_all, mes_sel, usuario, orcamentos, rendas_df)
     st.download_button(
         label="⬇️ Baixar PDF",
@@ -1824,6 +1860,7 @@ def inject_mobile_css():
 
 def main():
     db_init()
+    _migrar_rendas()
     inject_mobile_css()
 
     # Fix de teclado no ag-grid SelectboxColumn no mobile (bug 5)
