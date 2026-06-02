@@ -317,6 +317,17 @@ def delete_categoria_completa(cat_name: str, rules: dict, usuario: str) -> int:
 def delete_transaction(uid: str, usuario: str):
     db_exec("DELETE FROM transacoes WHERE uid=:uid AND usuario=:u", {"uid": uid, "u": usuario})
 
+def delete_renda(nome: str, usuario: str):
+    db_exec("DELETE FROM rendas WHERE nome=:n AND usuario=:u", {"n": nome, "u": usuario})
+    fetch_rendas.clear()
+
+def add_renda(nome: str, valor: float, usuario: str):
+    db_exec("""
+        INSERT INTO rendas (nome, usuario, valor) VALUES (:n, :u, :v)
+        ON CONFLICT (nome, usuario) DO UPDATE SET valor=EXCLUDED.valor
+    """, {"n": nome, "u": usuario, "v": valor})
+    fetch_rendas.clear()
+
 def delete_all_data(usuario: str):
     with get_engine().begin() as conn:
         for tbl in ["transacoes", "orcamentos", "rendas", "historico"]:
@@ -476,18 +487,27 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
     gastos = view[view["valor"] < 0].copy()
     gastos["abs"] = gastos["valor"].abs()
 
+    _chart_cfg = {"scrollZoom": False, "displayModeBar": False}
+
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Gastos por categoria")
         if not gastos.empty:
             by_cat = gastos.groupby("categoria")["abs"].sum().reset_index()
             by_cat.columns = ["Categoria", "Total"]
-            fig = px.pie(by_cat.sort_values("Total", ascending=False),
-                         names="Categoria", values="Total", hole=0.45,
+            by_cat_s = by_cat.sort_values("Total", ascending=False)
+            fig = px.pie(by_cat_s, names="Categoria", values="Total", hole=0.45,
                          color_discrete_sequence=px.colors.qualitative.Set2)
-            fig.update_traces(textposition="inside", textinfo="percent+label")
-            fig.update_layout(showlegend=False, margin=dict(t=10, b=0))
-            st.plotly_chart(fig, use_container_width=True)
+            fig.update_traces(
+                textposition="inside",
+                texttemplate="<b>%{label}</b><br>%{percent}",
+                hovertemplate="<b>%{label}</b><br>R$ %{value:,.2f}<extra></extra>",
+            )
+            fig.update_layout(
+                showlegend=False, margin=dict(t=10, b=0),
+                dragmode=False, clickmode="event",
+            )
+            st.plotly_chart(fig, use_container_width=True, config=_chart_cfg)
         else:
             st.info("Sem gastos registrados neste período.")
 
@@ -497,8 +517,11 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
             by_day = gastos.groupby(gastos["data"].dt.date)["abs"].sum().reset_index()
             by_day.columns = ["Data", "Total"]
             fig2 = px.bar(by_day, x="Data", y="Total", color_discrete_sequence=["#8b5cf6"])
-            fig2.update_layout(xaxis_title="", yaxis_title="R$", margin=dict(t=10, b=0))
-            st.plotly_chart(fig2, use_container_width=True)
+            fig2.update_layout(
+                xaxis_title="", yaxis_title="R$", margin=dict(t=10, b=0),
+                dragmode=False,
+            )
+            st.plotly_chart(fig2, use_container_width=True, config=_chart_cfg)
         else:
             st.info("Sem gastos registrados neste período.")
 
@@ -536,133 +559,7 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
                                            "descricao": "Descrição", "categoria": "Categoria"}),
                      hide_index=True, use_container_width=True)
 
-    st.divider()
-    st.subheader("Transações")
-    busca = st.text_input("🔍 Buscar", placeholder="ex: uber, ifood, farmácia...")
-
-    tbl = view[["uid", "data", "valor", "descricao", "categoria", "tipo"]].sort_values("data", ascending=False).reset_index(drop=True)
-    if busca:
-        tbl = tbl[tbl["descricao"].str.contains(busca, case=False, na=False)].reset_index(drop=True)
-
-    uid_index        = tbl["uid"].copy()
-    tbl["data"]      = tbl["data"].dt.strftime("%d/%m/%Y")
-    tbl["valor"]     = tbl["valor"].map(brl)
-    tbl["descricao"] = tbl["descricao"].map(extract_merchant)
-    tbl["sel"]       = False
-    tbl = tbl.rename(columns={"sel": "✓", "data": "Data", "valor": "Valor",
-                               "descricao": "Descrição", "categoria": "Categoria", "tipo": "Tipo"})
-    tbl["Categoria ✏️"] = tbl["Categoria"]
-
-    edited = st.data_editor(
-        tbl[["✓", "Data", "Valor", "Tipo", "Descrição", "Categoria ✏️"]],
-        column_config={
-            "✓":          st.column_config.CheckboxColumn("✓", width="small"),
-            "Data":       st.column_config.Column(disabled=True),
-            "Valor":      st.column_config.Column(disabled=True),
-            "Tipo":       st.column_config.Column(disabled=True, width="small"),
-            "Descrição":  st.column_config.Column(disabled=True),
-            "Categoria ✏️": st.column_config.SelectboxColumn(
-                "Categoria ✏️", options=user_cats, required=True,
-            ),
-        },
-        hide_index=True, use_container_width=True, key="tx_editor",
-    )
-
-    # Mudanças inline salvam automaticamente
-    cat_orig   = tbl["Categoria ✏️"].reset_index(drop=True)
-    cat_edited = edited["Categoria ✏️"].reset_index(drop=True)
-    inline_changes = [
-        (uid_index.iloc[i], cat_edited.iloc[i])
-        for i in range(len(cat_edited))
-        if cat_edited.iloc[i] != cat_orig.iloc[i]
-    ]
-    if inline_changes:
-        save_categorias(inline_changes, usuario)
-        fetch_data.clear()
-        st.rerun()
-
-    selecionados = uid_index[edited[edited["✓"] == True].index].tolist()
-    n = len(selecionados)
-
-    if n > 0:
-        st.info(f"**{n} transação(ões) selecionada(s)**")
-        a1, a2, a3 = st.columns([3, 1, 1])
-        with a1:
-            cat_acao = st.selectbox("Definir categoria", user_cats, key="bulk_cat")
-        with a2:
-            if st.button("✅ Aplicar", use_container_width=True):
-                save_categorias([(uid, cat_acao) for uid in selecionados], usuario)
-                fetch_data.clear()
-                st.rerun()
-        with a3:
-            if st.button("🚫 Ignorar", use_container_width=True):
-                save_categorias([(uid, "Ignorar") for uid in selecionados], usuario)
-                fetch_data.clear()
-                st.rerun()
-    else:
-        st.caption("Clique em **Categoria ✏️** para mudar direto, ou marque ✓ para alterar várias de uma vez.")
-
-    if has_historico(usuario):
-        if st.button("↩️ Desfazer última alteração de categorias"):
-            n_revert = undo_last_tx(usuario)
-            fetch_data.clear()
-            st.success(f"{n_revert} transação(ões) revertida(s).")
-            st.rerun()
-
-    ignoradas = df_all[
-        (df_all["data"].dt.to_period("M").astype(str) == periodo_sel) &
-        (df_all["categoria"] == "Ignorar")
-    ].copy()
-
-    if not ignoradas.empty:
-        st.divider()
-        with st.expander(f"🙈 Ignoradas neste período ({len(ignoradas)}) — clique para gerenciar"):
-            st.caption("Selecione as que quer restaurar e escolha uma categoria, ou restaure uma por vez.")
-
-            ignoradas_tbl = ignoradas.sort_values("data", ascending=False).reset_index(drop=True)
-            ign_uid_index = ignoradas_tbl["uid"].copy()
-            ignoradas_tbl["✓"]        = False
-            ignoradas_tbl["Data"]     = ignoradas_tbl["data"].dt.strftime("%d/%m/%Y")
-            ignoradas_tbl["Valor"]    = ignoradas_tbl["valor"].map(brl)
-            ignoradas_tbl["Descrição"] = ignoradas_tbl["descricao"].map(extract_merchant)
-
-            ignoradas_tbl["Mover para ✏️"] = "Ignorar"
-            ign_cat_orig = ignoradas_tbl["Mover para ✏️"].reset_index(drop=True)
-
-            ign_edited = st.data_editor(
-                ignoradas_tbl[["✓", "Data", "Valor", "Descrição", "Mover para ✏️"]],
-                column_config={
-                    "✓":            st.column_config.CheckboxColumn("✓", width="small"),
-                    "Data":         st.column_config.Column(disabled=True),
-                    "Valor":        st.column_config.Column(disabled=True),
-                    "Descrição":    st.column_config.Column(disabled=True),
-                    "Mover para ✏️": st.column_config.SelectboxColumn(
-                        "Mover para ✏️", options=user_cats, required=True,
-                    ),
-                },
-                hide_index=True, use_container_width=True, key="ign_editor",
-            )
-
-            ign_cat_edited = ign_edited["Mover para ✏️"].reset_index(drop=True)
-            ign_inline = [
-                (ign_uid_index.iloc[i], ign_cat_edited.iloc[i])
-                for i in range(len(ign_cat_edited))
-                if ign_cat_edited.iloc[i] != ign_cat_orig.iloc[i]
-            ]
-            if ign_inline:
-                save_categorias(ign_inline, usuario)
-                fetch_data.clear()
-                st.rerun()
-
-            ign_selecionados = ign_uid_index[ign_edited[ign_edited["✓"] == True].index].tolist()
-            if ign_selecionados:
-                if st.button(f"🗑️ Remover {len(ign_selecionados)} do Ignorar → Não categorizado",
-                             use_container_width=True, key="btn_restaurar_ign"):
-                    save_categorias([(uid, "Não categorizado") for uid in ign_selecionados], usuario)
-                    fetch_data.clear()
-                    st.rerun()
-            else:
-                st.caption("Clique na coluna 'Mover para' para escolher a categoria, ou marque ✓ para restaurar várias de uma vez.")
+    render_tx_fragment(df_all, periodo_sel, cats_excluir, usuario, user_cats)
 
 # ── Orçamento ─────────────────────────────────────────────────────────────────
 def render_orcamento(df_all: pd.DataFrame, usuario: str, user_cats: list):
@@ -696,21 +593,33 @@ def render_orcamento(df_all: pd.DataFrame, usuario: str, user_cats: list):
 
     st.markdown("### 💵 Renda")
     rendas_df = fetch_rendas(usuario)
-    edited_rendas = st.data_editor(
-        rendas_df, num_rows="dynamic",
-        column_config={
-            "Fonte de renda": st.column_config.TextColumn(width="large"),
-            "Valor (R$)":     st.column_config.NumberColumn(min_value=0.0, step=0.01, format="R$ %.2f"),
-        },
-        hide_index=True, use_container_width=True, key="rendas_editor",
-    )
-    if st.button("💾 Salvar renda", key="salvar_rendas"):
-        save_rendas(edited_rendas, usuario)
-        fetch_rendas.clear()
-        st.toast("Renda salva!", icon="✅")
-        st.rerun()
 
-    total_renda = edited_rendas["Valor (R$)"].sum()
+    # Linha de cabeçalho
+    rh1, rh2, rh3 = st.columns([3, 2, 1])
+    rh1.markdown("**Fonte de renda**")
+    rh2.markdown("**Valor**")
+    rh3.markdown("")
+    for _, row in rendas_df.iterrows():
+        rc1, rc2, rc3 = st.columns([3, 2, 1])
+        rc1.write(str(row["Fonte de renda"]))
+        rc2.write(brl(float(row["Valor (R$)"])))
+        if rc3.button("🗑️", key=f"del_renda_{row['Fonte de renda']}", help="Excluir"):
+            delete_renda(str(row["Fonte de renda"]), usuario)
+            fetch_rendas.clear()
+            st.rerun()
+
+    with st.form("form_add_renda", clear_on_submit=True):
+        st.markdown("**Adicionar renda**")
+        fa1, fa2, fa3 = st.columns([3, 2, 1])
+        new_nome  = fa1.text_input("Fonte", placeholder="ex: Salário", label_visibility="collapsed")
+        new_val_s = fa2.text_input("Valor R$", placeholder="0,00", label_visibility="collapsed")
+        if fa3.form_submit_button("➕"):
+            if new_nome.strip():
+                add_renda(new_nome.strip(), parse_brl_input(new_val_s), usuario)
+                fetch_rendas.clear()
+                st.rerun()
+
+    total_renda = rendas_df["Valor (R$)"].sum()
 
     if "hidden_orc" not in st.session_state:
         st.session_state["hidden_orc"] = set()
@@ -873,8 +782,8 @@ def render_historico(df_all: pd.DataFrame, user_cats: list):
 
     fig = px.bar(by_mes_cat, x="Mês", y="Total", color="Categoria",
                  barmode="group", color_discrete_sequence=px.colors.qualitative.Set2)
-    fig.update_layout(xaxis_title="", yaxis_title="R$", legend_title="Categoria")
-    st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(xaxis_title="", yaxis_title="R$", legend_title="Categoria", dragmode=False)
+    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": False, "displayModeBar": False})
 
     st.subheader("Tabela resumo")
     pivot = by_mes_cat.pivot(index="Categoria", columns="Mês", values="Total").fillna(0)
@@ -905,6 +814,154 @@ def render_recorrentes(df_all: pd.DataFrame):
         "merchant": "Estabelecimento", "meses": "Meses",
         "media_mensal": "Média mensal", "total": "Total gasto",
     }), hide_index=True, use_container_width=True)
+
+# ── Fragmento de transações (sem scroll ao editar categoria) ──────────────────
+@st.fragment
+def render_tx_fragment(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
+                       usuario: str, user_cats: list):
+    mask = df_all["data"].dt.to_period("M").astype(str) == periodo_sel
+    view = df_all[mask & ~df_all["categoria"].isin(cats_excluir)].copy()
+    view["tipo"] = view["descricao"].map(get_tipo)
+    tipo_sel = st.session_state.get("tipo_filter", "Todos")
+    if tipo_sel != "Todos":
+        view = view[view["tipo"] == tipo_sel]
+
+    st.divider()
+    st.subheader("Transações")
+    busca = st.text_input("🔍 Buscar", placeholder="ex: uber, ifood, farmácia...")
+
+    tbl = view[["uid", "data", "valor", "descricao", "categoria", "tipo"]].sort_values("data", ascending=False).reset_index(drop=True)
+    if busca:
+        tbl = tbl[tbl["descricao"].str.contains(busca, case=False, na=False)].reset_index(drop=True)
+
+    uid_index        = tbl["uid"].copy()
+    tbl["data"]      = tbl["data"].dt.strftime("%d/%m/%Y")
+    tbl["valor"]     = tbl["valor"].map(brl)
+    tbl["descricao"] = tbl["descricao"].map(extract_merchant)
+    tbl["sel"]       = False
+    tbl = tbl.rename(columns={"sel": "✓", "data": "Data", "valor": "Valor",
+                               "descricao": "Descrição", "categoria": "Categoria", "tipo": "Tipo"})
+    tbl["Categoria ✏️"] = tbl["Categoria"]
+
+    edited = st.data_editor(
+        tbl[["✓", "Data", "Valor", "Tipo", "Descrição", "Categoria ✏️"]],
+        column_config={
+            "✓":          st.column_config.CheckboxColumn("✓", width="small"),
+            "Data":       st.column_config.Column(disabled=True),
+            "Valor":      st.column_config.Column(disabled=True),
+            "Tipo":       st.column_config.Column(disabled=True, width="small"),
+            "Descrição":  st.column_config.Column(disabled=True),
+            "Categoria ✏️": st.column_config.SelectboxColumn(
+                "Categoria ✏️", options=user_cats, required=True,
+            ),
+        },
+        hide_index=True, use_container_width=True, key="tx_editor",
+    )
+
+    cat_orig   = tbl["Categoria ✏️"].reset_index(drop=True)
+    cat_edited = edited["Categoria ✏️"].reset_index(drop=True)
+    pending_cats = {
+        uid_index.iloc[i]: cat_edited.iloc[i]
+        for i in range(len(cat_edited))
+        if cat_edited.iloc[i] != cat_orig.iloc[i]
+    }
+
+    selecionados = uid_index[edited[edited["✓"] == True].index].tolist()
+    n = len(selecionados)
+
+    if pending_cats:
+        ca, cb = st.columns([4, 1])
+        if ca.button(f"💾 Salvar {len(pending_cats)} categoria(s) alterada(s)", type="primary", use_container_width=True):
+            save_categorias(list(pending_cats.items()), usuario)
+            fetch_data.clear()
+            st.session_state.pop("tx_editor", None)
+            st.rerun(scope="app")
+        if cb.button("✕", use_container_width=True, help="Descartar alterações"):
+            st.session_state.pop("tx_editor", None)
+            st.rerun(scope="app")
+
+    if n > 0:
+        st.info(f"**{n} transação(ões) selecionada(s)**")
+        a1, a2, a3 = st.columns([3, 1, 1])
+        with a1:
+            cat_acao = st.selectbox("Definir categoria", user_cats, key="bulk_cat")
+        with a2:
+            if st.button("✅ Aplicar", use_container_width=True):
+                save_categorias([(uid, cat_acao) for uid in selecionados], usuario)
+                fetch_data.clear()
+                st.session_state.pop("tx_editor", None)
+                st.rerun(scope="app")
+        with a3:
+            if st.button("🚫 Ignorar", use_container_width=True):
+                save_categorias([(uid, "Ignorar") for uid in selecionados], usuario)
+                fetch_data.clear()
+                st.session_state.pop("tx_editor", None)
+                st.rerun(scope="app")
+    elif not pending_cats:
+        st.caption("Clique em **Categoria ✏️** para mudar direto, ou marque ✓ para alterar várias de uma vez.")
+
+    if has_historico(usuario):
+        if st.button("↩️ Desfazer última alteração de categorias"):
+            n_revert = undo_last_tx(usuario)
+            fetch_data.clear()
+            st.success(f"{n_revert} transação(ões) revertida(s).")
+            st.rerun(scope="app")
+
+    ignoradas = df_all[
+        (df_all["data"].dt.to_period("M").astype(str) == periodo_sel) &
+        (df_all["categoria"] == "Ignorar")
+    ].copy()
+
+    if not ignoradas.empty:
+        st.divider()
+        with st.expander(f"🙈 Ignoradas neste período ({len(ignoradas)}) — clique para gerenciar"):
+            st.caption("Selecione as que quer restaurar e escolha uma categoria, ou restaure uma por vez.")
+            ignoradas_tbl = ignoradas.sort_values("data", ascending=False).reset_index(drop=True)
+            ign_uid_index = ignoradas_tbl["uid"].copy()
+            ignoradas_tbl["✓"]         = False
+            ignoradas_tbl["Data"]      = ignoradas_tbl["data"].dt.strftime("%d/%m/%Y")
+            ignoradas_tbl["Valor"]     = ignoradas_tbl["valor"].map(brl)
+            ignoradas_tbl["Descrição"] = ignoradas_tbl["descricao"].map(extract_merchant)
+            ignoradas_tbl["Mover para ✏️"] = "Ignorar"
+            ign_cat_orig = ignoradas_tbl["Mover para ✏️"].reset_index(drop=True)
+
+            ign_edited = st.data_editor(
+                ignoradas_tbl[["✓", "Data", "Valor", "Descrição", "Mover para ✏️"]],
+                column_config={
+                    "✓":             st.column_config.CheckboxColumn("✓", width="small"),
+                    "Data":          st.column_config.Column(disabled=True),
+                    "Valor":         st.column_config.Column(disabled=True),
+                    "Descrição":     st.column_config.Column(disabled=True),
+                    "Mover para ✏️": st.column_config.SelectboxColumn(
+                        "Mover para ✏️", options=user_cats, required=True,
+                    ),
+                },
+                hide_index=True, use_container_width=True, key="ign_editor",
+            )
+
+            ign_cat_edited = ign_edited["Mover para ✏️"].reset_index(drop=True)
+            ign_pending = {
+                ign_uid_index.iloc[i]: ign_cat_edited.iloc[i]
+                for i in range(len(ign_cat_edited))
+                if ign_cat_edited.iloc[i] != ign_cat_orig.iloc[i]
+            }
+            if ign_pending:
+                if st.button(f"💾 Mover {len(ign_pending)} transação(ões)", type="primary", use_container_width=True):
+                    save_categorias(list(ign_pending.items()), usuario)
+                    fetch_data.clear()
+                    st.session_state.pop("ign_editor", None)
+                    st.rerun(scope="app")
+
+            ign_selecionados = ign_uid_index[ign_edited[ign_edited["✓"] == True].index].tolist()
+            if ign_selecionados:
+                if st.button(f"🗑️ Remover {len(ign_selecionados)} do Ignorar → Não categorizado",
+                             use_container_width=True, key="btn_restaurar_ign"):
+                    save_categorias([(uid, "Não categorizado") for uid in ign_selecionados], usuario)
+                    fetch_data.clear()
+                    st.session_state.pop("ign_editor", None)
+                    st.rerun(scope="app")
+            else:
+                st.caption("Clique na coluna 'Mover para' para escolher a categoria, ou marque ✓ para restaurar várias.")
 
 # ── Regras ────────────────────────────────────────────────────────────────────
 def render_regras(rules: dict, usuario: str, user_cats: list):
@@ -1014,6 +1071,27 @@ def inject_mobile_css():
         div[data-testid="stPlotlyChart"] {
             width: 100% !important;
         }
+        /* Métricas sem truncar */
+        [data-testid="stMetricValue"] {
+            font-size: 1.1rem !important;
+            white-space: normal !important;
+            overflow: visible !important;
+            word-break: break-word !important;
+        }
+        /* Seta do selectbox no ag-grid sempre visível */
+        .ag-cell .ag-cell-editor .ag-picker-field-wrapper,
+        .ag-cell-editor-popup .ag-picker-field-wrapper {
+            display: flex !important;
+        }
+        .ag-select .ag-picker-field-icon {
+            opacity: 1 !important;
+        }
+        /* Área de toque maior para células editáveis */
+        .ag-cell[col-id="Categoria ✏️"],
+        .ag-cell[col-id="Mover para ✏️"] {
+            cursor: pointer !important;
+            -webkit-tap-highlight-color: rgba(139,92,246,0.2) !important;
+        }
     }
     </style>
     """, unsafe_allow_html=True)
@@ -1022,11 +1100,47 @@ def main():
     db_init()
     inject_mobile_css()
 
+    # Fix de teclado no ag-grid SelectboxColumn no mobile (bug 5)
+    import streamlit.components.v1 as components
+    components.html("""
+    <script>
+    (function() {
+        function fixInputMode() {
+            try {
+                var doc = window.parent ? window.parent.document : document;
+                doc.querySelectorAll('.ag-text-field-input').forEach(function(el) {
+                    if (!el.getAttribute('inputmode-fixed')) {
+                        el.setAttribute('inputmode', 'none');
+                        el.setAttribute('inputmode-fixed', '1');
+                    }
+                });
+            } catch(e) {}
+        }
+        setInterval(fixInputMode, 400);
+        fixInputMode();
+    })();
+    </script>
+    """, height=0, scrolling=False)
+
     if "usuario" not in st.session_state:
         render_login()
         return
 
     usuario = st.session_state["usuario"]
+
+    # Carregar regras e categorias ANTES da sidebar para que checkboxes incluam cats customizadas
+    rules = load_rules(usuario)
+    user_cats = list(ALL_CATS)
+    for cat in rules:
+        if cat not in user_cats:
+            user_cats.append(cat)
+
+    _EXCLUIR_DEFAULTS = {
+        "Fatura Cartão": True, "Investimento": True, "Resgate RDB": True, "Ignorar": True,
+        "Entrada": False, "Pix Recebido": False, "Pix Enviado": False,
+        "Transporte": False, "Alimentação": False, "Saúde": False,
+        "Telefone/Internet": False, "Dívidas/Boletos": False, "Outros": False,
+    }
 
     with st.sidebar:
         st.title("💜 Nubank Tracker")
@@ -1038,7 +1152,7 @@ def main():
 
         file = st.file_uploader("Importar extrato (.csv)", type="csv")
         if file:
-            rows = parse_csv(file, load_rules(usuario))
+            rows = parse_csv(file, rules)
             n = import_rows(rows, usuario)
             fetch_data.clear()
             if n:
@@ -1063,19 +1177,17 @@ def main():
         )
 
         st.markdown("**Excluir dos totais**")
-        EXCLUIR_CONFIG = [
-            ("Fatura Cartão", True), ("Investimento", True),
-            ("Resgate RDB",   True), ("Ignorar",      True),
-            ("Entrada",      False), ("Pix Recebido", False),
-            ("Pix Enviado",  False), ("Transporte",   False),
-            ("Alimentação",  False), ("Saúde",        False),
-            ("Telefone/Internet", False), ("Dívidas/Boletos", False),
-            ("Outros",       False),
-        ]
+        # Inclui todas as categorias (inclusive as customizadas criadas pelo usuário)
+        sidebar_cats = list(_EXCLUIR_DEFAULTS.keys())
+        for cat in user_cats:
+            if cat not in sidebar_cats and cat != "Não categorizado":
+                sidebar_cats.append(cat)
+
         cats_excluir = []
         c1, c2 = st.columns(2)
-        for i, (cat, default) in enumerate(EXCLUIR_CONFIG):
+        for i, cat in enumerate(sidebar_cats):
             col = c1 if i % 2 == 0 else c2
+            default = _EXCLUIR_DEFAULTS.get(cat, False)
             if col.checkbox(cat, value=default, key=f"excl_{cat}"):
                 cats_excluir.append(cat)
 
@@ -1089,12 +1201,6 @@ def main():
                 fetch_orcamentos.clear()
                 fetch_rendas.clear()
                 st.rerun()
-
-    rules = load_rules(usuario)
-    user_cats = list(ALL_CATS)
-    for cat in rules:
-        if cat not in user_cats:
-            user_cats.append(cat)
 
     t1, t2, t3, t4, t5 = st.tabs(
         ["📊 Dashboard", "💰 Orçamento", "📈 Histórico", "🔄 Recorrentes", "⚙️ Regras"]
