@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import numpy as np
 import json
 import re
 import hashlib
@@ -1144,6 +1145,253 @@ def render_tx_fragment(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: lis
             else:
                 st.caption("Clique na coluna 'Mover para' para escolher a categoria, ou marque ✓ para restaurar várias.")
 
+# ── Previsão ──────────────────────────────────────────────────────────────────
+def render_previsao(df_all: pd.DataFrame, user_cats: list):
+    _EXCLUIR = {"Entrada", "Resgate RDB", "Fatura Cartão", "Investimento", "Ignorar"}
+    _NOMES   = ["jan","fev","mar","abr","mai","jun","jul","ago","set","out","nov","dez"]
+
+    def fmt_mes(s: str) -> str:
+        y, m = s.split("-")
+        return f"{_NOMES[int(m)-1]}/{y}"
+
+    if df_all.empty or df_all["data"].dt.to_period("M").nunique() < 3:
+        st.info("Importe pelo menos 3 meses de extrato para gerar previsões.")
+        return
+
+    gastos = df_all[
+        (df_all["valor"] < 0) & (~df_all["categoria"].isin(_EXCLUIR))
+    ].copy()
+    gastos["abs"] = gastos["valor"].abs()
+    gastos["mes"] = gastos["data"].dt.to_period("M").astype(str)
+
+    meses_sorted = sorted(gastos["mes"].unique())
+    n_meses = len(meses_sorted)
+    mes_idx = {m: i for i, m in enumerate(meses_sorted)}
+    proximo = str(pd.Period(meses_sorted[-1], freq="M") + 1)
+
+    by_mc = gastos.groupby(["mes", "categoria"])["abs"].sum().reset_index()
+
+    previsoes = []
+    for cat in by_mc["categoria"].unique():
+        sub = by_mc[by_mc["categoria"] == cat].sort_values("mes")
+        if len(sub) < 2:
+            continue
+        x = np.array([mes_idx[m] for m in sub["mes"]], dtype=float)
+        y = sub["abs"].values.astype(float)
+        coef     = np.polyfit(x, y, 1)
+        prev_val = float(max(0.0, np.polyval(coef, float(n_meses))))
+        media    = float(y.mean())
+        std      = float(y.std()) if len(y) > 1 else 0.0
+        delta    = coef[0]
+        tendencia = "📈" if delta > media * 0.05 else ("📉" if delta < -media * 0.05 else "➡️")
+        previsoes.append({
+            "Categoria": cat, "Tendência": tendencia,
+            "Média histórica": media, "Previsão": prev_val,
+            "_ic": std,
+        })
+
+    if not previsoes:
+        st.info("Dados insuficientes para previsão.")
+        return
+
+    df_p = pd.DataFrame(previsoes).sort_values("Previsão", ascending=False)
+
+    st.markdown(f"### Projeção para **{fmt_mes(proximo)}**")
+    st.caption("Regressão linear sobre o histórico mensal de cada categoria. ★ = ponto previsto.")
+
+    total_prev  = df_p["Previsão"].sum()
+    total_media = df_p["Média histórica"].sum()
+    diff        = total_prev - total_media
+    c1, c2, c3  = st.columns(3)
+    c1.metric("Total previsto",    brl(total_prev))
+    c2.metric("Média histórica",   brl(total_media))
+    c3.metric("Variação",          brl(diff),
+              delta=f"{diff/total_media*100:+.1f}%" if total_media > 0 else None,
+              delta_color="inverse")
+    st.divider()
+
+    # Gráfico barras horizontais com intervalo de confiança
+    df_chart = df_p.sort_values("Previsão")
+    fig = px.bar(
+        df_chart, x="Previsão", y="Categoria", orientation="h",
+        error_x=df_chart["_ic"],
+        color="Previsão", color_continuous_scale="Purples",
+        labels={"Previsão": "R$"},
+    )
+    fig.update_layout(
+        xaxis_title="R$", yaxis_title="",
+        coloraxis_showscale=False,
+        margin=dict(t=10, b=0), dragmode=False,
+    )
+    st.plotly_chart(fig, use_container_width=True,
+                    config={"scrollZoom": False, "displayModeBar": False})
+    st.divider()
+
+    # Tabela resumo
+    df_tbl = df_p[["Tendência", "Categoria", "Média histórica", "Previsão"]].copy()
+    df_tbl["Média histórica"] = df_tbl["Média histórica"].map(brl)
+    df_tbl["Previsão"]        = df_tbl["Previsão"].map(brl)
+    st.dataframe(df_tbl, hide_index=True, use_container_width=True)
+    st.divider()
+
+    # Linha histórica + ponto previsto
+    st.subheader("Evolução histórica por categoria")
+    cats_disp = list(by_mc["categoria"].unique())
+    cats_sel  = st.multiselect("Categorias", cats_disp,
+                               default=cats_disp[:min(5, len(cats_disp))],
+                               key="prev_cats")
+    if cats_sel:
+        hist = by_mc[by_mc["categoria"].isin(cats_sel)].copy()
+        hist["mes_fmt"] = hist["mes"].apply(fmt_mes)
+
+        # Adiciona ponto de previsão
+        extras = []
+        for cat in cats_sel:
+            row = df_p[df_p["Categoria"] == cat]
+            if not row.empty:
+                extras.append({"mes": proximo,
+                               "mes_fmt": fmt_mes(proximo) + " ★",
+                               "categoria": cat,
+                               "abs": row.iloc[0]["Previsão"]})
+        if extras:
+            hist = pd.concat([hist, pd.DataFrame(extras)], ignore_index=True)
+
+        fig2 = px.line(hist, x="mes_fmt", y="abs", color="categoria",
+                       markers=True,
+                       color_discrete_sequence=px.colors.qualitative.Set2,
+                       labels={"mes_fmt": "Mês", "abs": "R$", "categoria": "Categoria"})
+        fig2.update_layout(xaxis_title="", yaxis_title="R$", dragmode=False)
+        st.plotly_chart(fig2, use_container_width=True,
+                        config={"scrollZoom": False, "displayModeBar": False})
+
+# ── Relatório / Exportação ─────────────────────────────────────────────────────
+def _gerar_excel(df_all: pd.DataFrame, mes: str) -> bytes:
+    _NOMES   = ["jan","fev","mar","abr","mai","jun","jul","ago","set","out","nov","dez"]
+    _EXCLUIR = {"Fatura Cartão", "Investimento", "Resgate RDB", "Ignorar"}
+
+    def fmt_mes(s):
+        y, m = s.split("-")
+        return f"{_NOMES[int(m)-1]}/{y}"
+
+    mask   = df_all["data"].dt.to_period("M").astype(str) == mes
+    df_mes = df_all[mask].copy()
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+
+        # --- Aba 1: Resumo ---
+        df_gastos = df_mes[
+            (df_mes["valor"] < 0) & (~df_mes["categoria"].isin(_EXCLUIR))
+        ].copy()
+        df_gastos["abs"] = df_gastos["valor"].abs()
+        by_cat = (df_gastos.groupby("categoria")["abs"].sum()
+                  .reset_index()
+                  .rename(columns={"categoria": "Categoria", "abs": "Gasto (R$)"})
+                  .sort_values("Gasto (R$)", ascending=False))
+        by_cat["% do total"] = (by_cat["Gasto (R$)"] / by_cat["Gasto (R$)"].sum() * 100
+                                ).map(lambda v: f"{v:.1f}%")
+        by_cat["Gasto (R$)"] = by_cat["Gasto (R$)"].map(lambda v: round(v, 2))
+
+        entradas = float(df_mes[df_mes["valor"] > 0]["valor"].sum())
+        saidas   = float(df_mes[df_mes["valor"] < 0]["valor"].sum())
+        rodape   = pd.DataFrame([
+            {"Categoria": "", "Gasto (R$)": None, "% do total": ""},
+            {"Categoria": "TOTAL SAÍDAS",   "Gasto (R$)": round(abs(saidas), 2),          "% do total": ""},
+            {"Categoria": "TOTAL ENTRADAS", "Gasto (R$)": round(entradas, 2),              "% do total": ""},
+            {"Categoria": "SALDO",          "Gasto (R$)": round(entradas + saidas, 2),     "% do total": ""},
+        ])
+        resumo = pd.concat([by_cat, rodape], ignore_index=True)
+        resumo.to_excel(writer, sheet_name=f"Resumo {fmt_mes(mes)}", index=False)
+
+        # --- Aba 2: Transações ---
+        tx = df_mes[["data", "descricao", "categoria", "valor"]].copy()
+        tx["data"]      = tx["data"].dt.strftime("%d/%m/%Y")
+        tx["descricao"] = tx["descricao"].apply(extract_merchant)
+        tx["valor"]     = tx["valor"].map(lambda v: round(v, 2))
+        tx = tx.rename(columns={"data": "Data", "descricao": "Descrição",
+                                 "categoria": "Categoria", "valor": "Valor (R$)"})
+        tx.sort_values("Data").to_excel(writer, sheet_name="Transações", index=False)
+
+        # --- Aba 3: Histórico mensal ---
+        if df_all["data"].dt.to_period("M").nunique() >= 2:
+            hist = (
+                df_all[df_all["valor"] < 0]
+                .assign(abs=lambda d: d["valor"].abs(),
+                        mes=lambda d: d["data"].dt.to_period("M").astype(str))
+                .groupby(["categoria", "mes"])["abs"].sum()
+                .reset_index()
+                .pivot(index="categoria", columns="mes", values="abs")
+                .fillna(0)
+                .round(2)
+            )
+            hist.columns = [fmt_mes(c) for c in hist.columns]
+            hist.index.name = "Categoria"
+            hist.to_excel(writer, sheet_name="Histórico mensal")
+
+        # Ajusta largura das colunas em todas as abas
+        for sheet in writer.sheets.values():
+            for col in sheet.columns:
+                max_w = max((len(str(cell.value or "")) for cell in col), default=10)
+                sheet.column_dimensions[col[0].column_letter].width = min(max_w + 4, 50)
+
+    return output.getvalue()
+
+
+def render_relatorio(df_all: pd.DataFrame, usuario: str):
+    _NOMES   = ["jan","fev","mar","abr","mai","jun","jul","ago","set","out","nov","dez"]
+    _EXCLUIR = {"Fatura Cartão", "Investimento", "Resgate RDB", "Ignorar"}
+
+    def fmt_mes(s):
+        y, m = s.split("-")
+        return f"{_NOMES[int(m)-1]}/{y}"
+
+    st.subheader("Relatório financeiro")
+    if df_all.empty:
+        st.info("Importe um extrato para gerar relatórios.")
+        return
+
+    meses    = sorted(df_all["data"].dt.to_period("M").astype(str).unique(), reverse=True)
+    col_ms, _ = st.columns([2, 4])
+    mes_sel  = col_ms.selectbox("📅 Mês", meses, format_func=fmt_mes, key="mes_relatorio")
+
+    excel_bytes = _gerar_excel(df_all, mes_sel)
+    st.download_button(
+        label="⬇️ Baixar Excel (.xlsx)",
+        data=excel_bytes,
+        file_name=f"relatorio_{mes_sel}_{usuario}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        type="primary",
+    )
+    st.caption("3 abas: **Resumo** (gastos por categoria), **Transações** (extrato completo), **Histórico mensal** (comparativo entre meses).")
+    st.divider()
+
+    # Prévia
+    st.subheader("Prévia")
+    mask     = df_all["data"].dt.to_period("M").astype(str) == mes_sel
+    df_mes   = df_all[mask].copy()
+    entradas = float(df_mes[df_mes["valor"] > 0]["valor"].sum())
+    saidas   = float(df_mes[df_mes["valor"] < 0]["valor"].sum())
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("💰 Entradas", brl(entradas))
+    c2.metric("💸 Saídas",   brl(abs(saidas)))
+    c3.metric("📊 Saldo",    brl(entradas + saidas))
+    st.divider()
+
+    df_gastos = df_mes[
+        (df_mes["valor"] < 0) & (~df_mes["categoria"].isin(_EXCLUIR))
+    ].copy()
+    df_gastos["abs"] = df_gastos["valor"].abs()
+    by_cat = (df_gastos.groupby("categoria")["abs"].sum()
+              .reset_index()
+              .sort_values("abs", ascending=False))
+    total_saidas = by_cat["abs"].sum()
+    by_cat["% do total"] = (by_cat["abs"] / total_saidas * 100).map(lambda v: f"{v:.1f}%") if total_saidas > 0 else "—"
+    by_cat["abs"] = by_cat["abs"].map(brl)
+    by_cat = by_cat.rename(columns={"categoria": "Categoria", "abs": "Total"})
+    st.dataframe(by_cat, hide_index=True, use_container_width=True)
+
 # ── Regras ────────────────────────────────────────────────────────────────────
 def render_regras(rules: dict, usuario: str, user_cats: list):
     st.subheader("Regras de categorização")
@@ -1386,14 +1634,17 @@ def main():
                 fetch_rendas.clear()
                 st.rerun()
 
-    t1, t2, t3, t4, t5 = st.tabs(
-        ["📊 Dashboard", "💰 Orçamento", "📈 Histórico", "🔄 Recorrentes", "⚙️ Regras"]
-    )
+    t1, t2, t3, t4, t5, t6, t7 = st.tabs([
+        "📊 Dashboard", "💰 Orçamento", "📉 Previsão",
+        "📈 Histórico", "🔄 Recorrentes", "📄 Relatório", "⚙️ Regras"
+    ])
     with t1: render_dashboard(df_all, periodo_sel, cats_excluir, usuario, user_cats)
     with t2: render_orcamento(df_all, usuario, user_cats)
-    with t3: render_historico(df_all, user_cats)
-    with t4: render_recorrentes(df_all)
-    with t5: render_regras(rules, usuario, user_cats)
+    with t3: render_previsao(df_all, user_cats)
+    with t4: render_historico(df_all, user_cats)
+    with t5: render_recorrentes(df_all)
+    with t6: render_relatorio(df_all, usuario)
+    with t7: render_regras(rules, usuario, user_cats)
 
 
 if __name__ == "__main__":
