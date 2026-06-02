@@ -1265,76 +1265,159 @@ def render_previsao(df_all: pd.DataFrame, user_cats: list):
                         config={"scrollZoom": False, "displayModeBar": False})
 
 # ── Relatório / Exportação ─────────────────────────────────────────────────────
-def _gerar_excel(df_all: pd.DataFrame, mes: str) -> bytes:
+def _gerar_pdf(df_all: pd.DataFrame, mes: str, usuario: str) -> bytes:
+    from fpdf import FPDF
+
     _NOMES   = ["jan","fev","mar","abr","mai","jun","jul","ago","set","out","nov","dez"]
     _EXCLUIR = {"Fatura Cartão", "Investimento", "Resgate RDB", "Ignorar"}
+    ROXO  = (88, 28, 135)
+    CINZA = (100, 100, 100)
 
     def fmt_mes(s):
         y, m = s.split("-")
         return f"{_NOMES[int(m)-1]}/{y}"
 
-    mask   = df_all["data"].dt.to_period("M").astype(str) == mes
-    df_mes = df_all[mask].copy()
+    def p(text, n=100):
+        """Garante compatibilidade latin-1 para fontes built-in do FPDF."""
+        return str(text)[:n].encode("latin-1", errors="replace").decode("latin-1")
 
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+    mask     = df_all["data"].dt.to_period("M").astype(str) == mes
+    df_mes   = df_all[mask].copy()
+    entradas = float(df_mes[df_mes["valor"] > 0]["valor"].sum())
+    saidas   = float(df_mes[df_mes["valor"] < 0]["valor"].sum())
+    saldo    = entradas + saidas
 
-        # --- Aba 1: Resumo ---
-        df_gastos = df_mes[
-            (df_mes["valor"] < 0) & (~df_mes["categoria"].isin(_EXCLUIR))
-        ].copy()
-        df_gastos["abs"] = df_gastos["valor"].abs()
-        by_cat = (df_gastos.groupby("categoria")["abs"].sum()
-                  .reset_index()
-                  .rename(columns={"categoria": "Categoria", "abs": "Gasto (R$)"})
-                  .sort_values("Gasto (R$)", ascending=False))
-        by_cat["% do total"] = (by_cat["Gasto (R$)"] / by_cat["Gasto (R$)"].sum() * 100
-                                ).map(lambda v: f"{v:.1f}%")
-        by_cat["Gasto (R$)"] = by_cat["Gasto (R$)"].map(lambda v: round(v, 2))
+    df_gastos = df_mes[
+        (df_mes["valor"] < 0) & (~df_mes["categoria"].isin(_EXCLUIR))
+    ].copy()
+    df_gastos["abs"] = df_gastos["valor"].abs()
+    by_cat = (df_gastos.groupby("categoria")["abs"].sum()
+              .reset_index().sort_values("abs", ascending=False))
+    total_gastos = float(by_cat["abs"].sum())
 
-        entradas = float(df_mes[df_mes["valor"] > 0]["valor"].sum())
-        saidas   = float(df_mes[df_mes["valor"] < 0]["valor"].sum())
-        rodape   = pd.DataFrame([
-            {"Categoria": "", "Gasto (R$)": None, "% do total": ""},
-            {"Categoria": "TOTAL SAÍDAS",   "Gasto (R$)": round(abs(saidas), 2),          "% do total": ""},
-            {"Categoria": "TOTAL ENTRADAS", "Gasto (R$)": round(entradas, 2),              "% do total": ""},
-            {"Categoria": "SALDO",          "Gasto (R$)": round(entradas + saidas, 2),     "% do total": ""},
-        ])
-        resumo = pd.concat([by_cat, rodape], ignore_index=True)
-        resumo.to_excel(writer, sheet_name=f"Resumo {fmt_mes(mes).replace('/', '-')}", index=False)
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.set_margins(15, 15, 15)
+    pdf.add_page()
+    W = 180
 
-        # --- Aba 2: Transações ---
-        tx = df_mes[["data", "descricao", "categoria", "valor"]].copy()
-        tx["data"]      = tx["data"].dt.strftime("%d/%m/%Y")
-        tx["descricao"] = tx["descricao"].apply(extract_merchant)
-        tx["valor"]     = tx["valor"].map(lambda v: round(v, 2))
-        tx = tx.rename(columns={"data": "Data", "descricao": "Descrição",
-                                 "categoria": "Categoria", "valor": "Valor (R$)"})
-        tx.sort_values("Data").to_excel(writer, sheet_name="Transações", index=False)
+    # ── Cabeçalho ──
+    pdf.set_font("Helvetica", "B", 20)
+    pdf.set_text_color(*ROXO)
+    pdf.cell(W, 10, "Controle Financeiro", ln=True, align="C")
+    pdf.set_font("Helvetica", "", 11)
+    pdf.set_text_color(*CINZA)
+    pdf.cell(W, 7, p(f"Relatorio mensal  -  {fmt_mes(mes)}  |  {usuario}"), ln=True, align="C")
+    pdf.ln(3)
+    pdf.set_draw_color(*ROXO)
+    pdf.set_line_width(0.6)
+    pdf.line(15, pdf.get_y(), 195, pdf.get_y())
+    pdf.ln(6)
 
-        # --- Aba 3: Histórico mensal ---
-        if df_all["data"].dt.to_period("M").nunique() >= 2:
-            hist = (
-                df_all[df_all["valor"] < 0]
+    # ── Métricas ──
+    labels = ["Entradas", "Saidas", "Saldo"]
+    values = [brl(entradas), brl(abs(saidas)), brl(saldo)]
+    colors = [(22,163,74), (220,38,38), (22,163,74) if saldo >= 0 else (220,38,38)]
+    cw = 58
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(*CINZA)
+    for lbl in labels:
+        pdf.cell(cw, 5, lbl, align="C")
+        pdf.cell(2, 5, "")
+    pdf.ln(5)
+    for val, col in zip(values, colors):
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.set_text_color(*col)
+        pdf.cell(cw, 8, p(val), align="C")
+        pdf.cell(2, 8, "")
+    pdf.ln(12)
+
+    # ── Gastos por categoria ──
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.set_text_color(*ROXO)
+    pdf.cell(W, 7, "Gastos por categoria", ln=True)
+    pdf.ln(1)
+    pdf.set_draw_color(200, 200, 200)
+    pdf.set_line_width(0.2)
+    pdf.set_fill_color(245, 240, 255)
+    pdf.set_text_color(40, 40, 40)
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.cell(95, 7, "Categoria",  border=1, fill=True)
+    pdf.cell(50, 7, "Total",      border=1, fill=True, align="R")
+    pdf.cell(35, 7, "% do total", border=1, fill=True, align="R", ln=True)
+    alt = False
+    pdf.set_font("Helvetica", "", 9)
+    for _, row in by_cat.iterrows():
+        pct = f"{row['abs']/total_gastos*100:.1f}%" if total_gastos > 0 else "-"
+        pdf.set_fill_color(252, 250, 255) if alt else pdf.set_fill_color(255, 255, 255)
+        pdf.cell(95, 6, p(row["categoria"]),   border=1, fill=True)
+        pdf.cell(50, 6, p(brl(row["abs"])),    border=1, fill=True, align="R")
+        pdf.cell(35, 6, pct,                   border=1, fill=True, align="R", ln=True)
+        alt = not alt
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_fill_color(245, 240, 255)
+    pdf.cell(95, 7, "TOTAL",               border=1, fill=True)
+    pdf.cell(50, 7, p(brl(total_gastos)),  border=1, fill=True, align="R")
+    pdf.cell(35, 7, "100%",                border=1, fill=True, align="R", ln=True)
+    pdf.ln(8)
+
+    # ── Top 5 maiores gastos ──
+    top5 = df_gastos.nlargest(5, "abs")[["data", "descricao", "abs"]].copy()
+    if not top5.empty:
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.set_text_color(*ROXO)
+        pdf.cell(W, 7, "Top 5 maiores gastos", ln=True)
+        pdf.ln(1)
+        pdf.set_fill_color(245, 240, 255)
+        pdf.set_text_color(40, 40, 40)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(30,  7, "Data",      border=1, fill=True)
+        pdf.cell(115, 7, "Descricao", border=1, fill=True)
+        pdf.cell(35,  7, "Valor",     border=1, fill=True, align="R", ln=True)
+        pdf.set_font("Helvetica", "", 9)
+        for _, row in top5.iterrows():
+            pdf.cell(30,  6, row["data"].strftime("%d/%m/%Y"),            border=1)
+            pdf.cell(115, 6, p(extract_merchant(row["descricao"]), 55),   border=1)
+            pdf.cell(35,  6, p(brl(row["abs"])),                          border=1, align="R", ln=True)
+        pdf.ln(8)
+
+    # ── Histórico mensal de saídas ──
+    if df_all["data"].dt.to_period("M").nunique() >= 2:
+        hist = (df_all[df_all["valor"] < 0]
                 .assign(abs=lambda d: d["valor"].abs(),
-                        mes=lambda d: d["data"].dt.to_period("M").astype(str))
-                .groupby(["categoria", "mes"])["abs"].sum()
-                .reset_index()
-                .pivot(index="categoria", columns="mes", values="abs")
-                .fillna(0)
-                .round(2)
-            )
-            hist.columns = [fmt_mes(c) for c in hist.columns]
-            hist.index.name = "Categoria"
-            hist.to_excel(writer, sheet_name="Histórico mensal")
+                        mes_h=lambda d: d["data"].dt.to_period("M").astype(str))
+                .groupby("mes_h")["abs"].sum()
+                .reset_index().sort_values("mes_h"))
+        hist["fmt"] = hist["mes_h"].apply(fmt_mes)
 
-        # Ajusta largura das colunas em todas as abas
-        for sheet in writer.sheets.values():
-            for col in sheet.columns:
-                max_w = max((len(str(cell.value or "")) for cell in col), default=10)
-                sheet.column_dimensions[col[0].column_letter].width = min(max_w + 4, 50)
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.set_text_color(*ROXO)
+        pdf.cell(W, 7, "Historico de saidas mensais", ln=True)
+        pdf.ln(1)
+        n  = len(hist)
+        cw = min(40, W // n)
+        pdf.set_fill_color(245, 240, 255)
+        pdf.set_text_color(40, 40, 40)
+        pdf.set_font("Helvetica", "B", 9)
+        for _, row in hist.iterrows():
+            pdf.cell(cw, 7, p(row["fmt"]), border=1, fill=True, align="C")
+        pdf.ln()
+        pdf.set_font("Helvetica", "", 9)
+        for _, row in hist.iterrows():
+            pdf.cell(cw, 6, p(brl(row["abs"])), border=1, align="C")
+        pdf.ln(8)
 
-    return output.getvalue()
+    # ── Rodapé ──
+    pdf.set_y(-18)
+    pdf.set_draw_color(*ROXO)
+    pdf.set_line_width(0.3)
+    pdf.line(15, pdf.get_y(), 195, pdf.get_y())
+    pdf.ln(2)
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.set_text_color(*CINZA)
+    pdf.cell(W, 5, p(f"Gerado em {datetime.now().strftime('%d/%m/%Y as %H:%M')}  |  Controle Financeiro"), align="C")
+
+    return bytes(pdf.output())
 
 
 def render_relatorio(df_all: pd.DataFrame, usuario: str):
@@ -1350,20 +1433,19 @@ def render_relatorio(df_all: pd.DataFrame, usuario: str):
         st.info("Importe um extrato para gerar relatórios.")
         return
 
-    meses    = sorted(df_all["data"].dt.to_period("M").astype(str).unique(), reverse=True)
+    meses     = sorted(df_all["data"].dt.to_period("M").astype(str).unique(), reverse=True)
     col_ms, _ = st.columns([2, 4])
-    mes_sel  = col_ms.selectbox("📅 Mês", meses, format_func=fmt_mes, key="mes_relatorio")
+    mes_sel   = col_ms.selectbox("📅 Mês", meses, format_func=fmt_mes, key="mes_relatorio")
 
-    excel_bytes = _gerar_excel(df_all, mes_sel)
+    pdf_bytes = _gerar_pdf(df_all, mes_sel, usuario)
     st.download_button(
-        label="⬇️ Baixar Excel (.xlsx)",
-        data=excel_bytes,
-        file_name=f"relatorio_{mes_sel}_{usuario}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        label="⬇️ Baixar PDF",
+        data=pdf_bytes,
+        file_name=f"relatorio_{mes_sel}_{usuario}.pdf",
+        mime="application/pdf",
         use_container_width=True,
         type="primary",
     )
-    st.caption("3 abas: **Resumo** (gastos por categoria), **Transações** (extrato completo), **Histórico mensal** (comparativo entre meses).")
     st.divider()
 
     # Prévia
@@ -1384,9 +1466,8 @@ def render_relatorio(df_all: pd.DataFrame, usuario: str):
     ].copy()
     df_gastos["abs"] = df_gastos["valor"].abs()
     by_cat = (df_gastos.groupby("categoria")["abs"].sum()
-              .reset_index()
-              .sort_values("abs", ascending=False))
-    total_saidas = by_cat["abs"].sum()
+              .reset_index().sort_values("abs", ascending=False))
+    total_saidas = float(by_cat["abs"].sum())
     by_cat["% do total"] = (by_cat["abs"] / total_saidas * 100).map(lambda v: f"{v:.1f}%") if total_saidas > 0 else "—"
     by_cat["abs"] = by_cat["abs"].map(brl)
     by_cat = by_cat.rename(columns={"categoria": "Categoria", "abs": "Total"})
