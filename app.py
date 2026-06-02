@@ -1265,159 +1265,374 @@ def render_previsao(df_all: pd.DataFrame, user_cats: list):
                         config={"scrollZoom": False, "displayModeBar": False})
 
 # ── Relatório / Exportação ─────────────────────────────────────────────────────
-def _gerar_pdf(df_all: pd.DataFrame, mes: str, usuario: str) -> bytes:
+def _gerar_pdf(df_all: pd.DataFrame, mes: str, usuario: str,
+               orcamentos: dict, rendas_df: pd.DataFrame) -> bytes:
     from fpdf import FPDF
 
     _NOMES   = ["jan","fev","mar","abr","mai","jun","jul","ago","set","out","nov","dez"]
     _EXCLUIR = {"Fatura Cartão", "Investimento", "Resgate RDB", "Ignorar"}
     ROXO  = (88, 28, 135)
+    ROXO_L= (245, 240, 255)
     CINZA = (100, 100, 100)
+    VERDE = (22, 163, 74)
+    VERM  = (220, 38, 38)
+    AMAR  = (180, 120, 0)
+    BCO   = (255, 255, 255)
+    PRETO = (30, 30, 30)
 
     def fmt_mes(s):
         y, m = s.split("-")
         return f"{_NOMES[int(m)-1]}/{y}"
 
     def p(text, n=100):
-        """Garante compatibilidade latin-1 para fontes built-in do FPDF."""
         return str(text)[:n].encode("latin-1", errors="replace").decode("latin-1")
 
-    mask     = df_all["data"].dt.to_period("M").astype(str) == mes
-    df_mes   = df_all[mask].copy()
-    df_view  = df_mes[~df_mes["categoria"].isin(_EXCLUIR)].copy()
-    entradas = float(df_view[df_view["valor"] > 0]["valor"].sum())
-    saidas   = float(df_view[df_view["valor"] < 0]["valor"].sum())
-    saldo    = entradas + saidas
+    # ── Dados principais ──────────────────────────────────────────────────────
+    mask    = df_all["data"].dt.to_period("M").astype(str) == mes
+    df_mes  = df_all[mask].copy()
+    df_view = df_mes[~df_mes["categoria"].isin(_EXCLUIR)].copy()
+    entradas    = float(df_view[df_view["valor"] > 0]["valor"].sum())
+    saidas      = float(df_view[df_view["valor"] < 0]["valor"].sum())
+    saldo       = entradas + saidas
+    total_renda = float(rendas_df["Valor (R$)"].sum()) if not rendas_df.empty else 0.0
 
-    df_gastos = df_view[df_view["valor"] < 0].copy()
-    df_gastos["abs"] = df_gastos["valor"].abs()
-    by_cat = (df_gastos.groupby("categoria")["abs"].sum()
-              .reset_index().sort_values("abs", ascending=False))
+    df_g = df_view[df_view["valor"] < 0].copy()
+    df_g["abs"] = df_g["valor"].abs()
+    by_cat       = df_g.groupby("categoria")["abs"].sum().reset_index().sort_values("abs", ascending=False)
     total_gastos = float(by_cat["abs"].sum())
 
-    pdf = FPDF(orientation="P", unit="mm", format="A4")
-    pdf.set_auto_page_break(auto=True, margin=15)
+    # ── Mês anterior ──────────────────────────────────────────────────────────
+    mes_ant  = str(pd.Period(mes, freq="M") - 1)
+    df_ant_g = df_all[
+        (df_all["data"].dt.to_period("M").astype(str) == mes_ant) &
+        (~df_all["categoria"].isin(_EXCLUIR)) & (df_all["valor"] < 0)
+    ].copy()
+    df_ant_g["abs"] = df_ant_g["valor"].abs()
+    by_cat_ant = df_ant_g.groupby("categoria")["abs"].sum().to_dict() if not df_ant_g.empty else {}
+
+    # ── Média histórica ────────────────────────────────────────────────────────
+    media_hist = {}
+    if df_all["data"].dt.to_period("M").nunique() >= 2:
+        media_hist = (
+            df_all[(df_all["valor"] < 0) & (~df_all["categoria"].isin(_EXCLUIR))]
+            .assign(abs=lambda d: d["valor"].abs(),
+                    mes_h=lambda d: d["data"].dt.to_period("M").astype(str))
+            .groupby(["mes_h","categoria"])["abs"].sum()
+            .groupby("categoria").mean().to_dict()
+        )
+
+    # ── Estabelecimentos e semanal ─────────────────────────────────────────────
+    df_g["merchant"] = df_g["descricao"].apply(extract_merchant)
+    top_merch = (df_g.groupby("merchant")
+                 .agg(total=("abs","sum"), qtd=("abs","count"))
+                 .reset_index().sort_values("total", ascending=False).head(10))
+    df_g["semana"] = df_g["data"].apply(lambda d: f"Semana {(d.day-1)//7 + 1}")
+    por_semana = df_g.groupby("semana")["abs"].sum().reset_index().sort_values("semana")
+
+    # ── Classe PDF com rodapé ──────────────────────────────────────────────────
+    class PDF(FPDF):
+        def footer(self):
+            self.set_y(-11)
+            self.set_draw_color(*CINZA)
+            self.set_line_width(0.2)
+            self.line(15, self.get_y(), 195, self.get_y())
+            self.set_font("Helvetica", "I", 7)
+            self.set_text_color(*CINZA)
+            txt = p(f"Controle Financeiro  |  {fmt_mes(mes)}  |  {usuario}  |  Pag. {self.page_no()}")
+            self.cell(0, 6, txt, align="C")
+
+    pdf = PDF(orientation="P", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=18)
     pdf.set_margins(15, 15, 15)
-    pdf.add_page()
     W = 180
 
-    # ── Cabeçalho ──
-    pdf.set_font("Helvetica", "B", 20)
-    pdf.set_text_color(*ROXO)
-    pdf.cell(W, 10, "Controle Financeiro", ln=True, align="C")
-    pdf.set_font("Helvetica", "", 11)
-    pdf.set_text_color(*CINZA)
-    pdf.cell(W, 7, p(f"Relatorio mensal  -  {fmt_mes(mes)}  |  {usuario}"), ln=True, align="C")
-    pdf.ln(3)
-    pdf.set_draw_color(*ROXO)
-    pdf.set_line_width(0.6)
-    pdf.line(15, pdf.get_y(), 195, pdf.get_y())
-    pdf.ln(6)
-
-    # ── Métricas ──
-    labels = ["Entradas", "Saidas", "Saldo"]
-    values = [brl(entradas), brl(abs(saidas)), brl(saldo)]
-    colors = [(22,163,74), (220,38,38), (22,163,74) if saldo >= 0 else (220,38,38)]
-    cw = 58
-    pdf.set_font("Helvetica", "", 9)
-    pdf.set_text_color(*CINZA)
-    for lbl in labels:
-        pdf.cell(cw, 5, lbl, align="C")
-        pdf.cell(2, 5, "")
-    pdf.ln(5)
-    for val, col in zip(values, colors):
-        pdf.set_font("Helvetica", "B", 13)
-        pdf.set_text_color(*col)
-        pdf.cell(cw, 8, p(val), align="C")
-        pdf.cell(2, 8, "")
-    pdf.ln(12)
-
-    # ── Gastos por categoria ──
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.set_text_color(*ROXO)
-    pdf.cell(W, 7, "Gastos por categoria", ln=True)
-    pdf.ln(1)
-    pdf.set_draw_color(200, 200, 200)
-    pdf.set_line_width(0.2)
-    pdf.set_fill_color(245, 240, 255)
-    pdf.set_text_color(40, 40, 40)
-    pdf.set_font("Helvetica", "B", 9)
-    pdf.cell(95, 7, "Categoria",  border=1, fill=True)
-    pdf.cell(50, 7, "Total",      border=1, fill=True, align="R")
-    pdf.cell(35, 7, "% do total", border=1, fill=True, align="R", ln=True)
-    alt = False
-    pdf.set_font("Helvetica", "", 9)
-    for _, row in by_cat.iterrows():
-        pct = f"{row['abs']/total_gastos*100:.1f}%" if total_gastos > 0 else "-"
-        if alt:
-            pdf.set_fill_color(252, 250, 255)
+    # ── Helpers de layout ─────────────────────────────────────────────────────
+    def section(title):
+        if pdf.get_y() > 248:
+            pdf.add_page()
         else:
-            pdf.set_fill_color(255, 255, 255)
-        pdf.cell(95, 6, p(row["categoria"]),   border=1, fill=True)
-        pdf.cell(50, 6, p(brl(row["abs"])),    border=1, fill=True, align="R")
-        pdf.cell(35, 6, pct,                   border=1, fill=True, align="R", ln=True)
-        alt = not alt
-    pdf.set_font("Helvetica", "B", 9)
-    pdf.set_fill_color(245, 240, 255)
-    pdf.cell(95, 7, "TOTAL",               border=1, fill=True)
-    pdf.cell(50, 7, p(brl(total_gastos)),  border=1, fill=True, align="R")
-    pdf.cell(35, 7, "100%",                border=1, fill=True, align="R", ln=True)
-    pdf.ln(8)
-
-    # ── Top 5 maiores gastos ──
-    top5 = df_gastos.nlargest(5, "abs")[["data", "descricao", "abs"]].copy()
-    if not top5.empty:
-        pdf.set_font("Helvetica", "B", 12)
+            pdf.ln(4)
+        pdf.set_draw_color(*ROXO)
+        pdf.set_line_width(0.3)
+        pdf.set_fill_color(*ROXO_L)
+        pdf.set_font("Helvetica", "B", 10)
         pdf.set_text_color(*ROXO)
-        pdf.cell(W, 7, "Top 5 maiores gastos", ln=True)
+        pdf.cell(W, 7, p(f"  {title}"), border="LB", fill=True, ln=True)
+        pdf.set_text_color(*PRETO)
+        pdf.set_draw_color(180, 180, 180)
+        pdf.set_line_width(0.2)
         pdf.ln(1)
-        pdf.set_fill_color(245, 240, 255)
-        pdf.set_text_color(40, 40, 40)
-        pdf.set_font("Helvetica", "B", 9)
-        pdf.cell(30,  7, "Data",      border=1, fill=True)
-        pdf.cell(115, 7, "Descricao", border=1, fill=True)
-        pdf.cell(35,  7, "Valor",     border=1, fill=True, align="R", ln=True)
-        pdf.set_font("Helvetica", "", 9)
-        for _, row in top5.iterrows():
-            pdf.cell(30,  6, row["data"].strftime("%d/%m/%Y"),            border=1)
-            pdf.cell(115, 6, p(extract_merchant(row["descricao"]), 55),   border=1)
-            pdf.cell(35,  6, p(brl(row["abs"])),                          border=1, align="R", ln=True)
-        pdf.ln(8)
 
-    # ── Histórico mensal de saídas ──
+    def th(*cols):
+        pdf.set_fill_color(*ROXO_L)
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_text_color(*PRETO)
+        pdf.set_draw_color(180, 180, 180)
+        pdf.set_line_width(0.2)
+        for w, lbl, aln in cols:
+            pdf.cell(w, 6, p(lbl), border=1, fill=True, align=aln)
+        pdf.ln()
+
+    def tr(*cols_vals, fill=False):
+        if fill:
+            pdf.set_fill_color(250, 248, 255)
+        else:
+            pdf.set_fill_color(*BCO)
+        pdf.set_font("Helvetica", "", 8)
+        pdf.set_text_color(*PRETO)
+        pdf.set_draw_color(180, 180, 180)
+        pdf.set_line_width(0.2)
+        for w, val, aln in cols_vals:
+            pdf.cell(w, 5.5, p(str(val), int(w * 2.5)), border=1, fill=True, align=aln)
+        pdf.ln()
+
+    def tr_total(*cols_vals):
+        pdf.set_fill_color(*ROXO_L)
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_text_color(*PRETO)
+        pdf.set_draw_color(180, 180, 180)
+        for w, val, aln in cols_vals:
+            pdf.cell(w, 6, p(str(val), int(w * 2.5)), border=1, fill=True, align=aln)
+        pdf.ln()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    pdf.add_page()
+
+    # ── Banner roxo ───────────────────────────────────────────────────────────
+    pdf.set_fill_color(*ROXO)
+    pdf.rect(0, 0, 210, 30, style="F")
+    pdf.set_xy(15, 5)
+    pdf.set_font("Helvetica", "B", 22)
+    pdf.set_text_color(*BCO)
+    pdf.cell(W, 10, "Controle Financeiro", align="C", ln=True)
+    pdf.set_xy(15, 16)
+    pdf.set_font("Helvetica", "", 11)
+    pdf.cell(W, 7, p(f"Relatorio Mensal  -  {fmt_mes(mes)}"), align="C", ln=True)
+    pdf.set_xy(15, 24)
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.cell(W, 5, p(f"Gerado em {datetime.now().strftime('%d/%m/%Y as %H:%M')}  |  Usuario: {usuario}"), align="C")
+    pdf.set_y(35)
+
+    # ── Resumo Financeiro (caixas) ────────────────────────────────────────────
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_text_color(*ROXO)
+    pdf.set_fill_color(*ROXO_L)
+    pdf.cell(W, 7, "  Resumo Financeiro", border="LB", fill=True, ln=True)
+    pdf.set_draw_color(180, 180, 180); pdf.set_line_width(0.2); pdf.ln(2)
+
+    bw = W / 3
+    labels_m = ["Entradas", "Saidas", "Saldo"]
+    values_m = [brl(entradas), brl(abs(saidas)), brl(saldo)]
+    colors_m = [VERDE, VERM, VERDE if saldo >= 0 else VERM]
+    yb = pdf.get_y()
+    for i, (lbl, val, col) in enumerate(zip(labels_m, values_m, colors_m)):
+        x = 15 + i * bw
+        pdf.set_fill_color(250, 248, 255)
+        pdf.rect(x, yb, bw - 1, 17, style="FD")
+        pdf.set_xy(x, yb + 1.5)
+        pdf.set_font("Helvetica", "", 8); pdf.set_text_color(*CINZA)
+        pdf.cell(bw - 1, 5, lbl, align="C")
+        pdf.set_xy(x, yb + 7)
+        pdf.set_font("Helvetica", "B", 12); pdf.set_text_color(*col)
+        pdf.cell(bw - 1, 8, p(val), align="C")
+    pdf.set_y(yb + 20)
+
+    if total_renda > 0:
+        pct_r = abs(saidas) / total_renda * 100
+        col_r = VERDE if pct_r <= 80 else (AMAR if pct_r <= 100 else VERM)
+        pdf.set_font("Helvetica", "", 9); pdf.set_text_color(*col_r)
+        pdf.cell(W, 5, p(f"Comprometimento da renda: {pct_r:.1f}%   ({brl(abs(saidas))} de {brl(total_renda)})"), align="C", ln=True)
+    pdf.ln(2)
+
+    # ── Fontes de Renda ───────────────────────────────────────────────────────
+    if not rendas_df.empty and total_renda > 0:
+        section("Fontes de Renda")
+        th((130,"Fonte","L"),(50,"Valor","R"))
+        for i, (_, row) in enumerate(rendas_df.iterrows()):
+            pct_ri = float(row["Valor (R$)"]) / total_renda * 100 if total_renda > 0 else 0
+            tr((130, f"{row['Fonte de renda']}  ({pct_ri:.1f}%)", "L"),
+               (50, brl(float(row["Valor (R$)"])), "R"), fill=bool(i % 2))
+        tr_total((130,"TOTAL","L"),(50, brl(total_renda),"R"))
+
+    # ── Gastos por Categoria ──────────────────────────────────────────────────
+    section("Gastos por Categoria")
+    th((72,"Categoria","L"),(32,"Total","R"),(20,"%","R"),(30,"Acum.%","R"),(26,"vs Media","R"))
+    acum = 0.0
+    for i, (_, row) in enumerate(by_cat.iterrows()):
+        pct_f = row["abs"] / total_gastos * 100 if total_gastos > 0 else 0
+        acum += pct_f
+        med   = media_hist.get(row["categoria"])
+        if med and med > 0:
+            vm_s = f"{(row['abs']/med - 1)*100:+.0f}%"
+            vm_c = VERM if row["abs"] > med * 1.1 else (AMAR if row["abs"] > med * 0.9 else VERDE)
+        else:
+            vm_s, vm_c = "-", CINZA
+        if i % 2:
+            pdf.set_fill_color(250, 248, 255)
+        else:
+            pdf.set_fill_color(*BCO)
+        pdf.set_font("Helvetica","",8); pdf.set_text_color(*PRETO)
+        pdf.set_draw_color(180,180,180); pdf.set_line_width(0.2)
+        pdf.cell(72, 5.5, p(row["categoria"],36), border=1, fill=True)
+        pdf.cell(32, 5.5, p(brl(row["abs"])), border=1, fill=True, align="R")
+        pdf.cell(20, 5.5, f"{pct_f:.1f}%", border=1, fill=True, align="R")
+        pdf.cell(30, 5.5, f"{acum:.1f}%", border=1, fill=True, align="R")
+        pdf.set_text_color(*vm_c)
+        pdf.cell(26, 5.5, vm_s, border=1, fill=True, align="R")
+        pdf.ln()
+    tr_total((72,"TOTAL","L"),(32,brl(total_gastos),"R"),(20,"100%","R"),(30,"","L"),(26,"","L"))
+
+    # ── Orçamento vs Realizado ────────────────────────────────────────────────
+    if orcamentos:
+        section("Orcamento vs Realizado")
+        th((60,"Categoria","L"),(28,"Orcado","R"),(28,"Realizado","R"),(28,"Diferenca","R"),(20,"Uso %","R"),(16,"","C"))
+        tot_o = 0.0; tot_r = 0.0
+        for i, cat in enumerate(sorted(orcamentos.keys())):
+            lim  = float(orcamentos[cat])
+            real = float(by_cat[by_cat["categoria"]==cat]["abs"].sum()) if cat in by_cat["categoria"].values else 0.0
+            diff = lim - real
+            uso  = real / lim * 100 if lim > 0 else 0
+            tot_o += lim; tot_r += real
+            if i % 2:
+                pdf.set_fill_color(250, 248, 255)
+            else:
+                pdf.set_fill_color(*BCO)
+            pdf.set_font("Helvetica","",8); pdf.set_text_color(*PRETO)
+            pdf.set_draw_color(180,180,180); pdf.set_line_width(0.2)
+            pdf.cell(60, 5.5, p(cat,30), border=1, fill=True)
+            pdf.cell(28, 5.5, p(brl(lim)), border=1, fill=True, align="R")
+            pdf.cell(28, 5.5, p(brl(real)), border=1, fill=True, align="R")
+            pdf.set_text_color(*VERM if diff < 0 else VERDE)
+            pdf.cell(28, 5.5, p(brl(diff)), border=1, fill=True, align="R")
+            pdf.set_text_color(*VERM if uso > 100 else (AMAR if uso > 85 else VERDE))
+            pdf.cell(20, 5.5, f"{uso:.0f}%", border=1, fill=True, align="R")
+            pdf.set_text_color(*PRETO)
+            if real <= lim:
+                pdf.set_fill_color(220,255,220)
+            else:
+                pdf.set_fill_color(255,220,220)
+            pdf.cell(16, 5.5, "OK" if real <= lim else "!", border=1, fill=True, align="C")
+            pdf.ln()
+        uso_tot = tot_r / tot_o * 100 if tot_o > 0 else 0
+        tr_total((60,"TOTAL","L"),(28,brl(tot_o),"R"),(28,brl(tot_r),"R"),
+                 (28,brl(tot_o-tot_r),"R"),(20,f"{uso_tot:.0f}%","R"),(16,"","C"))
+
+    # ── Comparativo com Mês Anterior ──────────────────────────────────────────
+    if by_cat_ant:
+        section(f"Comparativo: {fmt_mes(mes_ant)}  vs  {fmt_mes(mes)}")
+        th((70,"Categoria","L"),(28,fmt_mes(mes_ant),"R"),(28,fmt_mes(mes),"R"),(27,"Var. R$","R"),(27,"Var. %","R"))
+        cats_c = sorted(set(list(by_cat["categoria"].values) + list(by_cat_ant.keys())))
+        for i, cat in enumerate(cats_c):
+            ant   = by_cat_ant.get(cat, 0.0)
+            atual = float(by_cat[by_cat["categoria"]==cat]["abs"].sum()) if cat in by_cat["categoria"].values else 0.0
+            delta = atual - ant
+            pct_d = (delta / ant * 100) if ant > 0 else (100.0 if atual > 0 else 0.0)
+            if i % 2:
+                pdf.set_fill_color(250, 248, 255)
+            else:
+                pdf.set_fill_color(*BCO)
+            pdf.set_font("Helvetica","",8); pdf.set_text_color(*PRETO)
+            pdf.set_draw_color(180,180,180); pdf.set_line_width(0.2)
+            pdf.cell(70, 5.5, p(cat,35), border=1, fill=True)
+            pdf.cell(28, 5.5, p(brl(ant)), border=1, fill=True, align="R")
+            pdf.cell(28, 5.5, p(brl(atual)), border=1, fill=True, align="R")
+            d_col = VERM if delta > 0 else VERDE
+            pdf.set_text_color(*d_col)
+            sign = "+" if delta >= 0 else ""
+            pdf.cell(27, 5.5, p(f"{sign}{brl(delta)}"), border=1, fill=True, align="R")
+            pdf.cell(27, 5.5, p(f"{sign}{pct_d:.1f}%"), border=1, fill=True, align="R")
+            pdf.ln()
+
+    # ── Alertas ────────────────────────────────────────────────────────────────
+    if media_hist:
+        alertas = [(c, float(v), media_hist[c])
+                   for c, v in by_cat.set_index("categoria")["abs"].items()
+                   if c in media_hist and float(v) > media_hist[c] * 1.2]
+        if alertas:
+            section("Alertas - Categorias Acima da Media Historica (>20%)")
+            th((65,"Categoria","L"),(38,"Este mes","R"),(37,"Media hist.","R"),(40,"Excesso","R"))
+            for i, (cat, atual, med) in enumerate(sorted(alertas, key=lambda x: x[1]-x[2], reverse=True)):
+                if i % 2:
+                    pdf.set_fill_color(255,245,245)
+                else:
+                    pdf.set_fill_color(255,252,252)
+                pdf.set_font("Helvetica","",8); pdf.set_text_color(*PRETO)
+                pdf.set_draw_color(180,180,180); pdf.set_line_width(0.2)
+                pdf.cell(65, 5.5, p(cat,32), border=1, fill=True)
+                pdf.cell(38, 5.5, p(brl(atual)), border=1, fill=True, align="R")
+                pdf.cell(37, 5.5, p(brl(med)), border=1, fill=True, align="R")
+                pdf.set_text_color(*VERM)
+                pdf.cell(40, 5.5, p(f"+{brl(atual - med)}"), border=1, fill=True, align="R")
+                pdf.ln()
+
+    # ── Top 10 Estabelecimentos ────────────────────────────────────────────────
+    if not top_merch.empty:
+        section("Top 10 Estabelecimentos")
+        th((80,"Estabelecimento","L"),(20,"Qtd","C"),(40,"Total","R"),(40,"% dos gastos","R"))
+        for i, (_, row) in enumerate(top_merch.iterrows()):
+            pct_m = row["total"] / total_gastos * 100 if total_gastos > 0 else 0
+            tr((80,row["merchant"],"L"),(20,int(row["qtd"]),"C"),
+               (40,brl(row["total"]),"R"),(40,f"{pct_m:.1f}%","R"), fill=bool(i%2))
+
+    # ── Distribuição Semanal ──────────────────────────────────────────────────
+    if not por_semana.empty:
+        section("Distribuicao Semanal de Gastos")
+        th((60,"Semana","L"),(60,"Total","R"),(60,"% do mes","R"))
+        for i, (_, row) in enumerate(por_semana.iterrows()):
+            pct_s = row["abs"] / total_gastos * 100 if total_gastos > 0 else 0
+            tr((60,row["semana"],"L"),(60,brl(row["abs"]),"R"),(60,f"{pct_s:.1f}%","R"), fill=bool(i%2))
+
+    # ── Top 10 Maiores Gastos ──────────────────────────────────────────────────
+    top10 = df_g.nlargest(10,"abs")[["data","descricao","categoria","abs"]].copy()
+    if not top10.empty:
+        section("Top 10 Maiores Gastos do Mes")
+        th((25,"Data","L"),(73,"Descricao","L"),(50,"Categoria","L"),(32,"Valor","R"))
+        for i, (_, row) in enumerate(top10.iterrows()):
+            tr((25,row["data"].strftime("%d/%m/%Y"),"L"),
+               (73,extract_merchant(row["descricao"]),"L"),
+               (50,row["categoria"],"L"),(32,brl(row["abs"]),"R"), fill=bool(i%2))
+
+    # ── Histórico Mensal de Saídas ────────────────────────────────────────────
     if df_all["data"].dt.to_period("M").nunique() >= 2:
-        hist = (df_all[df_all["valor"] < 0]
+        hist = (df_all[(df_all["valor"] < 0) & (~df_all["categoria"].isin(_EXCLUIR))]
                 .assign(abs=lambda d: d["valor"].abs(),
                         mes_h=lambda d: d["data"].dt.to_period("M").astype(str))
-                .groupby("mes_h")["abs"].sum()
-                .reset_index().sort_values("mes_h"))
+                .groupby("mes_h")["abs"].sum().reset_index().sort_values("mes_h"))
         hist["fmt"] = hist["mes_h"].apply(fmt_mes)
-
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.set_text_color(*ROXO)
-        pdf.cell(W, 7, "Historico de saidas mensais", ln=True)
-        pdf.ln(1)
-        n  = len(hist)
-        cw = min(40, W // n)
-        pdf.set_fill_color(245, 240, 255)
-        pdf.set_text_color(40, 40, 40)
-        pdf.set_font("Helvetica", "B", 9)
+        section("Historico Mensal de Saidas")
+        n_h = len(hist)
+        cw_h = min(35, W // n_h)
+        pdf.set_fill_color(*ROXO_L); pdf.set_font("Helvetica","B",8); pdf.set_text_color(*PRETO)
+        pdf.set_draw_color(180,180,180); pdf.set_line_width(0.2)
         for _, row in hist.iterrows():
-            pdf.cell(cw, 7, p(row["fmt"]), border=1, fill=True, align="C")
+            pdf.cell(cw_h, 6, p(row["fmt"]), border=1, fill=True, align="C")
         pdf.ln()
-        pdf.set_font("Helvetica", "", 9)
+        pdf.set_fill_color(*BCO); pdf.set_font("Helvetica","",8)
         for _, row in hist.iterrows():
-            pdf.cell(cw, 6, p(brl(row["abs"])), border=1, align="C")
-        pdf.ln(8)
+            pdf.cell(cw_h, 5.5, p(brl(row["abs"])), border=1, fill=True, align="C")
+        pdf.ln()
 
-    # ── Rodapé ──
-    pdf.set_y(-18)
-    pdf.set_draw_color(*ROXO)
-    pdf.set_line_width(0.3)
-    pdf.line(15, pdf.get_y(), 195, pdf.get_y())
-    pdf.ln(2)
-    pdf.set_font("Helvetica", "I", 8)
-    pdf.set_text_color(*CINZA)
-    pdf.cell(W, 5, p(f"Gerado em {datetime.now().strftime('%d/%m/%Y as %H:%M')}  |  Controle Financeiro"), align="C")
+    # ── Extrato Completo ───────────────────────────────────────────────────────
+    section("Extrato Completo do Mes")
+    pdf.set_font("Helvetica","I",7); pdf.set_text_color(*CINZA)
+    pdf.cell(W, 4, p(f"  {len(df_mes)} transacoes no periodo"), ln=True)
+    pdf.ln(1)
+    th((22,"Data","L"),(78,"Descricao","L"),(42,"Categoria","L"),(38,"Valor","R"))
+    for i, (_, row) in enumerate(df_mes.sort_values("data").iterrows()):
+        val = float(row["valor"])
+        if i % 2:
+            pdf.set_fill_color(250,248,255)
+        else:
+            pdf.set_fill_color(*BCO)
+        pdf.set_font("Helvetica","",7)
+        pdf.set_draw_color(180,180,180); pdf.set_line_width(0.2)
+        pdf.set_text_color(*PRETO)
+        pdf.cell(22, 5, row["data"].strftime("%d/%m/%Y"), border=1, fill=True)
+        pdf.cell(78, 5, p(extract_merchant(row["descricao"]),42), border=1, fill=True)
+        pdf.cell(42, 5, p(row["categoria"],22), border=1, fill=True)
+        pdf.set_text_color(*VERM if val < 0 else VERDE)
+        pdf.cell(38, 5, p(brl(val)), border=1, fill=True, align="R")
+        pdf.ln()
 
     return bytes(pdf.output())
 
@@ -1439,7 +1654,9 @@ def render_relatorio(df_all: pd.DataFrame, usuario: str):
     col_ms, _ = st.columns([2, 4])
     mes_sel   = col_ms.selectbox("📅 Mês", meses, format_func=fmt_mes, key="mes_relatorio")
 
-    pdf_bytes = _gerar_pdf(df_all, mes_sel, usuario)
+    orcamentos = fetch_orcamentos(mes_sel, usuario)
+    rendas_df  = fetch_rendas(usuario)
+    pdf_bytes  = _gerar_pdf(df_all, mes_sel, usuario, orcamentos, rendas_df)
     st.download_button(
         label="⬇️ Baixar PDF",
         data=pdf_bytes,
@@ -1448,28 +1665,26 @@ def render_relatorio(df_all: pd.DataFrame, usuario: str):
         use_container_width=True,
         type="primary",
     )
+    st.caption("O PDF contém: resumo, rendas, gastos por categoria, orçamento vs realizado, comparativo com mês anterior, alertas, top estabelecimentos, distribuição semanal, top 10 gastos e extrato completo.")
     st.divider()
 
-    # Prévia
     st.subheader("Prévia")
     mask     = df_all["data"].dt.to_period("M").astype(str) == mes_sel
     df_mes   = df_all[mask].copy()
     df_view  = df_mes[~df_mes["categoria"].isin(_EXCLUIR)].copy()
     entradas = float(df_view[df_view["valor"] > 0]["valor"].sum())
     saidas   = float(df_view[df_view["valor"] < 0]["valor"].sum())
-
     c1, c2, c3 = st.columns(3)
     c1.metric("💰 Entradas", brl(entradas))
     c2.metric("💸 Saídas",   brl(abs(saidas)))
     c3.metric("📊 Saldo",    brl(entradas + saidas))
     st.divider()
-
     df_gastos = df_view[df_view["valor"] < 0].copy()
     df_gastos["abs"] = df_gastos["valor"].abs()
     by_cat = (df_gastos.groupby("categoria")["abs"].sum()
               .reset_index().sort_values("abs", ascending=False))
-    total_saidas = float(by_cat["abs"].sum())
-    by_cat["% do total"] = (by_cat["abs"] / total_saidas * 100).map(lambda v: f"{v:.1f}%") if total_saidas > 0 else "—"
+    total_s = float(by_cat["abs"].sum())
+    by_cat["% do total"] = (by_cat["abs"] / total_s * 100).map(lambda v: f"{v:.1f}%") if total_s > 0 else "—"
     by_cat["abs"] = by_cat["abs"].map(brl)
     by_cat = by_cat.rename(columns={"categoria": "Categoria", "abs": "Total"})
     st.dataframe(by_cat, hide_index=True, use_container_width=True)
