@@ -1283,13 +1283,12 @@ def _gerar_pdf(df_all: pd.DataFrame, mes: str, usuario: str) -> bytes:
 
     mask     = df_all["data"].dt.to_period("M").astype(str) == mes
     df_mes   = df_all[mask].copy()
-    entradas = float(df_mes[df_mes["valor"] > 0]["valor"].sum())
-    saidas   = float(df_mes[df_mes["valor"] < 0]["valor"].sum())
+    df_view  = df_mes[~df_mes["categoria"].isin(_EXCLUIR)].copy()
+    entradas = float(df_view[df_view["valor"] > 0]["valor"].sum())
+    saidas   = float(df_view[df_view["valor"] < 0]["valor"].sum())
     saldo    = entradas + saidas
 
-    df_gastos = df_mes[
-        (df_mes["valor"] < 0) & (~df_mes["categoria"].isin(_EXCLUIR))
-    ].copy()
+    df_gastos = df_view[df_view["valor"] < 0].copy()
     df_gastos["abs"] = df_gastos["valor"].abs()
     by_cat = (df_gastos.groupby("categoria")["abs"].sum()
               .reset_index().sort_values("abs", ascending=False))
@@ -1349,7 +1348,10 @@ def _gerar_pdf(df_all: pd.DataFrame, mes: str, usuario: str) -> bytes:
     pdf.set_font("Helvetica", "", 9)
     for _, row in by_cat.iterrows():
         pct = f"{row['abs']/total_gastos*100:.1f}%" if total_gastos > 0 else "-"
-        pdf.set_fill_color(252, 250, 255) if alt else pdf.set_fill_color(255, 255, 255)
+        if alt:
+            pdf.set_fill_color(252, 250, 255)
+        else:
+            pdf.set_fill_color(255, 255, 255)
         pdf.cell(95, 6, p(row["categoria"]),   border=1, fill=True)
         pdf.cell(50, 6, p(brl(row["abs"])),    border=1, fill=True, align="R")
         pdf.cell(35, 6, pct,                   border=1, fill=True, align="R", ln=True)
@@ -1452,8 +1454,9 @@ def render_relatorio(df_all: pd.DataFrame, usuario: str):
     st.subheader("Prévia")
     mask     = df_all["data"].dt.to_period("M").astype(str) == mes_sel
     df_mes   = df_all[mask].copy()
-    entradas = float(df_mes[df_mes["valor"] > 0]["valor"].sum())
-    saidas   = float(df_mes[df_mes["valor"] < 0]["valor"].sum())
+    df_view  = df_mes[~df_mes["categoria"].isin(_EXCLUIR)].copy()
+    entradas = float(df_view[df_view["valor"] > 0]["valor"].sum())
+    saidas   = float(df_view[df_view["valor"] < 0]["valor"].sum())
 
     c1, c2, c3 = st.columns(3)
     c1.metric("💰 Entradas", brl(entradas))
@@ -1461,9 +1464,7 @@ def render_relatorio(df_all: pd.DataFrame, usuario: str):
     c3.metric("📊 Saldo",    brl(entradas + saidas))
     st.divider()
 
-    df_gastos = df_mes[
-        (df_mes["valor"] < 0) & (~df_mes["categoria"].isin(_EXCLUIR))
-    ].copy()
+    df_gastos = df_view[df_view["valor"] < 0].copy()
     df_gastos["abs"] = df_gastos["valor"].abs()
     by_cat = (df_gastos.groupby("categoria")["abs"].sum()
               .reset_index().sort_values("abs", ascending=False))
