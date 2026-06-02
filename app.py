@@ -4,11 +4,12 @@ import plotly.express as px
 import json
 import re
 import hashlib
+import io
 from pathlib import Path
 from datetime import datetime
 from sqlalchemy import create_engine, text
 
-st.set_page_config(page_title="Nubank Tracker", page_icon="💜", layout="wide")
+st.set_page_config(page_title="Controle Financeiro", page_icon="💜", layout="wide")
 
 BASE = Path(__file__).parent
 
@@ -397,28 +398,208 @@ def extract_merchant(desc: str) -> str:
             return m.group(1).strip()
     return desc.split(" - ")[0] if " - " in desc else desc
 
-def parse_csv(file, rules: dict) -> list[dict]:
+# ── Parsers multi-banco ───────────────────────────────────────────────────────
+def _decode(raw: bytes) -> str:
+    for enc in ["utf-8-sig", "utf-8", "latin-1", "cp1252"]:
+        try:
+            return raw.decode(enc)
+        except Exception:
+            pass
+    return raw.decode("latin-1", errors="replace")
+
+def _to_float(s) -> float | None:
+    s = re.sub(r"[R$\s]", "", str(s)).strip()
+    if not s or s in ("-", "nan", ""):
+        return None
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
     try:
-        df = pd.read_csv(file, encoding="utf-8")
-    except UnicodeDecodeError:
-        file.seek(0)
-        df = pd.read_csv(file, encoding="latin-1")
+        return float(s)
+    except ValueError:
+        return None
+
+def _to_date(s) -> str | None:
+    s = str(s).strip()
+    if re.match(r"^\d{8}", s):
+        try:
+            return pd.to_datetime(s[:8], format="%Y%m%d").strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    for fmt in ["%d/%m/%Y", "%Y-%m-%d", "%d/%m/%y", "%d-%m-%Y", "%Y/%m/%d"]:
+        try:
+            return pd.to_datetime(s[:10], format=fmt).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    return None
+
+def _uid(prefix: str, *parts) -> str:
+    h = hashlib.md5("|".join(str(p) for p in parts).encode()).hexdigest()[:12]
+    return f"{prefix}_{h}"
+
+def _find_col(cols: list[str], keywords: list[str]) -> str | None:
+    for kw in keywords:
+        for col in cols:
+            if kw.lower() in col.lower():
+                return col
+    return None
+
+def _parse_nubank(text: str, rules: dict) -> list[dict]:
+    df = pd.read_csv(io.StringIO(text), dtype=str)
+    if len(df.columns) < 4:
+        return []
     df.columns = ["Data", "Valor", "Identificador", "Descrição"]
-    df["Valor"] = df["Valor"].astype(float)
+    df["Valor"] = pd.to_numeric(df["Valor"], errors="coerce")
+    df = df.dropna(subset=["Valor"])
     df = df[~df["Descrição"].str.startswith("Valor adicionado", na=False)].copy()
     rows, seen = [], {}
     for _, r in df.iterrows():
-        base = r["Identificador"] + ("_p" if r["Valor"] > 0 else "_n")
+        base = str(r["Identificador"]) + ("_p" if r["Valor"] > 0 else "_n")
         seen[base] = seen.get(base, 0) + 1
-        uid = f"{base}_{seen[base]}" if seen[base] > 1 else base
+        uid = f"nu_{base}_{seen[base]}" if seen[base] > 1 else f"nu_{base}"
+        d = _to_date(r["Data"])
+        if d is None:
+            continue
         rows.append({
-            "uid":       uid,
-            "data":      pd.to_datetime(r["Data"], format="%d/%m/%Y").strftime("%Y-%m-%d"),
-            "valor":     r["Valor"],
+            "uid": uid, "data": d, "valor": float(r["Valor"]),
             "descricao": r["Descrição"],
             "categoria": categorize(r["Descrição"], r["Valor"], rules),
         })
     return rows
+
+def _parse_ofx(text: str, rules: dict) -> list[dict]:
+    rows = []
+    for block in re.findall(r"<STMTTRN>(.*?)</STMTTRN>", text, re.DOTALL | re.IGNORECASE):
+        def get(tag):
+            m = re.search(rf"<{tag}>\s*([^\n<]+)", block, re.IGNORECASE)
+            return m.group(1).strip() if m else ""
+        dtposted = get("DTPOSTED") or get("DTTRADE")
+        trnamt   = get("TRNAMT")
+        fitid    = get("FITID")
+        memo     = get("MEMO") or get("NAME") or get("TRNTYPE")
+        data  = _to_date(dtposted)
+        valor = _to_float(trnamt)
+        if data is None or valor is None:
+            continue
+        uid = f"ofx_{fitid}" if fitid else _uid("ofx", data, valor, memo)
+        rows.append({
+            "uid": uid, "data": data, "valor": valor,
+            "descricao": memo,
+            "categoria": categorize(memo, valor, rules),
+        })
+    return rows
+
+def _parse_debit_credit(text: str, sep: str, rules: dict) -> list[dict]:
+    df = pd.read_csv(io.StringIO(text), sep=sep, dtype=str, skipinitialspace=True)
+    df.columns = [c.strip() for c in df.columns]
+    cols = list(df.columns)
+    col_data = _find_col(cols, ["data", "dt", "date"])
+    col_hist = _find_col(cols, ["histórico", "historico", "descrição", "descricao",
+                                 "memo", "lançamento", "lancamento", "detalhe"])
+    col_cred = _find_col(cols, ["crédito", "credito", "créd", "entrada"])
+    col_deb  = _find_col(cols, ["débito", "debito", "déb", "saída", "saida"])
+    if not col_data:
+        return []
+    rows = []
+    for _, r in df.iterrows():
+        data = _to_date(r.get(col_data, ""))
+        if data is None:
+            continue
+        desc = str(r.get(col_hist, "")).strip() if col_hist else ""
+        cred = _to_float(r.get(col_cred, "")) if col_cred else None
+        deb  = _to_float(r.get(col_deb, ""))  if col_deb  else None
+        if cred and cred > 0:
+            valor = cred
+        elif deb and deb > 0:
+            valor = -deb
+        else:
+            continue
+        rows.append({
+            "uid": _uid("csv", data, valor, desc),
+            "data": data, "valor": valor, "descricao": desc,
+            "categoria": categorize(desc, valor, rules),
+        })
+    return rows
+
+def _parse_generic(text: str, sep: str, rules: dict) -> list[dict]:
+    df = pd.read_csv(io.StringIO(text), sep=sep, dtype=str, skipinitialspace=True)
+    df.columns = [c.strip() for c in df.columns]
+    cols = list(df.columns)
+    col_data  = _find_col(cols, ["data", "dt", "date"])
+    col_hist  = _find_col(cols, ["descrição", "descricao", "histórico", "historico",
+                                  "título", "titulo", "memo", "lançamento", "lancamento"])
+    col_cred  = _find_col(cols, ["crédito", "credito", "créd", "entrada"])
+    col_deb   = _find_col(cols, ["débito", "debito", "déb", "saída", "saida"])
+    col_valor = _find_col(cols, ["valor", "value", "amount", "vl", "quantia"])
+    if not col_data or not (col_valor or (col_cred and col_deb)):
+        return []
+    rows = []
+    for _, r in df.iterrows():
+        data = _to_date(r.get(col_data, ""))
+        if data is None:
+            continue
+        desc = str(r.get(col_hist, "")).strip() if col_hist else ""
+        if col_cred and col_deb:
+            cred = _to_float(r.get(col_cred, ""))
+            deb  = _to_float(r.get(col_deb, ""))
+            if cred and cred > 0:
+                valor = cred
+            elif deb and deb > 0:
+                valor = -deb
+            else:
+                continue
+        else:
+            valor = _to_float(r.get(col_valor, ""))
+            if valor is None:
+                continue
+        rows.append({
+            "uid": _uid("csv", data, valor, desc),
+            "data": data, "valor": valor, "descricao": desc,
+            "categoria": categorize(desc, valor, rules),
+        })
+    return rows
+
+def parse_file(file, rules: dict) -> tuple[list[dict], str]:
+    """Auto-detecta formato e parseia. Retorna (rows, nome_do_banco)."""
+    raw  = file.read()
+    text = _decode(raw)
+
+    # OFX / QFX
+    header = text[:2000].upper()
+    if "OFXHEADER" in header or "<STMTTRN>" in header or ("<OFX>" in header and "TRNAMT" in header):
+        rows = _parse_ofx(text, rules)
+        return rows, "OFX"
+
+    # CSV — tenta vírgula, ponto-e-vírgula, tab
+    for sep in [",", ";", "\t"]:
+        try:
+            sample = pd.read_csv(io.StringIO(text), sep=sep, nrows=5, dtype=str)
+            if len(sample.columns) < 2:
+                continue
+            cols = [str(c).strip().lower() for c in sample.columns]
+
+            # Nubank conta: 4 colunas com 'identificador'
+            if len(sample.columns) == 4 and any("identif" in c for c in cols):
+                rows = _parse_nubank(text, rules)
+                return rows, "Nubank"
+
+            # Crédito + Débito (Bradesco, Itaú, BB, Caixa, Santander…)
+            has_cred = any("cr" in c and "dito" in c for c in cols)
+            has_deb  = any(("d" in c and "bito" in c) or "saída" in c or "saida" in c for c in cols)
+            if has_cred and has_deb:
+                rows = _parse_debit_credit(text, sep, rules)
+                if rows:
+                    return rows, "Bradesco / Itaú / BB"
+
+            # Genérico
+            rows = _parse_generic(text, sep, rules)
+            if rows:
+                return rows, "CSV"
+        except Exception:
+            continue
+
+    return [], "formato não reconhecido"
 
 def brl(v: float) -> str:
     s = f"R$ {abs(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -428,7 +609,7 @@ def brl(v: float) -> str:
 def render_login():
     _, col, _ = st.columns([1, 1.5, 1])
     with col:
-        st.markdown("## 💜 Nubank Tracker")
+        st.markdown("## 💜 Controle Financeiro")
         st.markdown("---")
         modo = st.radio("", ["Entrar", "Criar conta"], horizontal=True, label_visibility="collapsed")
         nome = st.text_input("Usuário", placeholder="ex: arthur")
@@ -1143,23 +1324,26 @@ def main():
     }
 
     with st.sidebar:
-        st.title("💜 Nubank Tracker")
+        st.title("💜 Controle Financeiro")
         col_u, col_s = st.columns([3, 1])
         col_u.caption(f"👤 {usuario}")
         if col_s.button("Sair"):
             del st.session_state["usuario"]
             st.rerun()
 
-        file = st.file_uploader("Importar extrato (.csv)", type="csv")
+        file = st.file_uploader("Importar extrato", type=["csv", "ofx", "qfx", "txt"])
         if file:
-            rows = parse_csv(file, rules)
-            n = import_rows(rows, usuario)
-            fetch_data.clear()
-            if n:
-                st.success(f"✅ {n} transações importadas!")
-                st.rerun()
+            rows, banco = parse_file(file, rules)
+            if not rows:
+                st.error(f"Não foi possível ler o arquivo. Formato não reconhecido.")
             else:
-                st.info("Nenhuma transação nova.")
+                n = import_rows(rows, usuario)
+                fetch_data.clear()
+                if n:
+                    st.success(f"✅ {n} transações importadas! ({banco})")
+                    st.rerun()
+                else:
+                    st.info(f"Nenhuma transação nova. ({banco})")
 
         st.divider()
         df_all = fetch_data(usuario)
