@@ -7,7 +7,12 @@ import re
 import hashlib
 import io
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
+import bcrypt
+import smtplib
+import secrets as _secrets_mod
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from sqlalchemy import create_engine, text
 
 st.set_page_config(page_title="Controle Financeiro", page_icon="💜", layout="wide")
@@ -117,26 +122,207 @@ def _migrar_rendas():
     except Exception:
         pass
 
+def _migrar_auth():
+    cols = [
+        ("senha_hash",         "TEXT"),
+        ("email",              "TEXT"),
+        ("email_verificado",   "BOOLEAN DEFAULT TRUE"),
+        ("token_verificacao",  "TEXT"),
+        ("token_reset",        "TEXT"),
+        ("token_reset_expira", "TEXT"),
+        ("tentativas",         "INT DEFAULT 0"),
+        ("bloqueado_ate",      "TEXT"),
+        ("ultimo_acesso",      "TEXT"),
+    ]
+    with get_engine().begin() as conn:
+        for col, defn in cols:
+            try:
+                conn.execute(text(f"ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS {col} {defn}"))
+            except Exception:
+                pass
+        try:
+            conn.execute(text("ALTER TABLE usuarios ALTER COLUMN pin_hash DROP NOT NULL"))
+        except Exception:
+            pass
+
 # ── Auth ──────────────────────────────────────────────────────────────────────
-def hash_pin(pin: str) -> str:
+_MAX_TENTATIVAS    = 5
+_BLOQUEIO_MINUTOS  = 15
+
+def _has_email_config() -> bool:
+    try:
+        return bool(st.secrets.get("EMAIL_USER") and st.secrets.get("EMAIL_PASSWORD"))
+    except Exception:
+        return False
+
+def _hash_senha(senha: str) -> str:
+    return bcrypt.hashpw(senha.encode(), bcrypt.gensalt()).decode()
+
+def _check_senha(senha: str, senha_hash: str) -> bool:
+    try:
+        return bcrypt.checkpw(senha.encode(), senha_hash.encode())
+    except Exception:
+        return False
+
+def _hash_pin_legacy(pin: str) -> str:
     return hashlib.sha256(pin.encode()).hexdigest()
+
+def _gerar_token(n: int = 6) -> str:
+    return "".join(_secrets_mod.choice("0123456789") for _ in range(n))
 
 def user_exists(nome: str) -> bool:
     rows, _ = db_exec("SELECT 1 FROM usuarios WHERE nome=:n", {"n": nome}, fetch=True)
     return bool(rows)
 
-def verify_pin(nome: str, pin: str) -> bool:
-    rows, _ = db_exec(
-        "SELECT 1 FROM usuarios WHERE nome=:n AND pin_hash=:h",
-        {"n": nome, "h": hash_pin(pin)}, fetch=True
+def get_user(nome: str):
+    rows, cols = db_exec("SELECT * FROM usuarios WHERE nome=:n", {"n": nome}, fetch=True)
+    return dict(zip(cols, rows[0])) if rows else None
+
+def verify_credenciais(nome: str, senha: str):
+    """Retorna (ok: bool, is_legacy: bool)."""
+    user = get_user(nome)
+    if not user:
+        return False, False
+    if user.get("senha_hash"):
+        return _check_senha(senha, user["senha_hash"]), False
+    if user.get("pin_hash"):
+        return user["pin_hash"] == _hash_pin_legacy(senha), True
+    return False, False
+
+def _check_bloqueio(nome: str):
+    """Retorna (bloqueado: bool, minutos_restantes: int)."""
+    user = get_user(nome)
+    if not user or not user.get("bloqueado_ate"):
+        return False, 0
+    bloqueado_ate = datetime.fromisoformat(user["bloqueado_ate"])
+    if datetime.now() < bloqueado_ate:
+        mins = int((bloqueado_ate - datetime.now()).total_seconds() / 60) + 1
+        return True, mins
+    db_exec("UPDATE usuarios SET tentativas=0, bloqueado_ate=NULL WHERE nome=:n", {"n": nome})
+    return False, 0
+
+def _registrar_falha(nome: str):
+    user = get_user(nome)
+    if not user:
+        return
+    tentativas = (user.get("tentativas") or 0) + 1
+    if tentativas >= _MAX_TENTATIVAS:
+        bloqueado_ate = (datetime.now() + timedelta(minutes=_BLOQUEIO_MINUTOS)).isoformat()
+        db_exec(
+            "UPDATE usuarios SET tentativas=:t, bloqueado_ate=:b WHERE nome=:n",
+            {"t": tentativas, "b": bloqueado_ate, "n": nome}
+        )
+    else:
+        db_exec("UPDATE usuarios SET tentativas=:t WHERE nome=:n", {"t": tentativas, "n": nome})
+
+def _resetar_falhas(nome: str):
+    db_exec("UPDATE usuarios SET tentativas=0, bloqueado_ate=NULL WHERE nome=:n", {"n": nome})
+
+def _registrar_acesso(nome: str):
+    ts = datetime.now().strftime("%d/%m/%Y às %H:%M")
+    db_exec("UPDATE usuarios SET ultimo_acesso=:ts WHERE nome=:n", {"ts": ts, "n": nome})
+
+def create_user(nome: str, senha: str, email: str = ""):
+    email_verificado = not bool(email) or not _has_email_config()
+    token = _gerar_token() if (email and _has_email_config()) else None
+    db_exec("""
+        INSERT INTO usuarios (nome, senha_hash, email, email_verificado, token_verificacao, tentativas)
+        VALUES (:n, :s, :e, :ev, :tv, 0)
+        ON CONFLICT (nome) DO NOTHING
+    """, {"n": nome, "s": _hash_senha(senha), "e": email or None,
+          "ev": email_verificado, "tv": token})
+    return token
+
+def upgrade_legacy_user(nome: str, nova_senha: str):
+    db_exec(
+        "UPDATE usuarios SET senha_hash=:s, pin_hash=NULL WHERE nome=:n",
+        {"s": _hash_senha(nova_senha), "n": nome}
     )
+
+def verificar_token_email(nome: str, token: str) -> bool:
+    rows, _ = db_exec(
+        "SELECT 1 FROM usuarios WHERE nome=:n AND token_verificacao=:t",
+        {"n": nome, "t": token}, fetch=True
+    )
+    if rows:
+        db_exec(
+            "UPDATE usuarios SET email_verificado=TRUE, token_verificacao=NULL WHERE nome=:n",
+            {"n": nome}
+        )
     return bool(rows)
 
-def create_user(nome: str, pin: str):
+def solicitar_reset(email: str):
+    """Retorna (nome, token) ou None se email não encontrado."""
+    rows, _ = db_exec("SELECT nome FROM usuarios WHERE email=:e", {"e": email}, fetch=True)
+    if not rows:
+        return None
+    nome  = rows[0][0]
+    token = _gerar_token()
+    expira = (datetime.now() + timedelta(minutes=_BLOQUEIO_MINUTOS)).isoformat()
     db_exec(
-        "INSERT INTO usuarios (nome, pin_hash) VALUES (:n, :h) ON CONFLICT (nome) DO NOTHING",
-        {"n": nome, "h": hash_pin(pin)}
+        "UPDATE usuarios SET token_reset=:t, token_reset_expira=:e WHERE nome=:n",
+        {"t": token, "e": expira, "n": nome}
     )
+    return nome, token
+
+def verificar_token_reset(nome: str, token: str) -> bool:
+    rows, _ = db_exec(
+        "SELECT token_reset_expira FROM usuarios WHERE nome=:n AND token_reset=:t",
+        {"n": nome, "t": token}, fetch=True
+    )
+    if not rows:
+        return False
+    return datetime.now() < datetime.fromisoformat(rows[0][0])
+
+def alterar_senha(nome: str, nova_senha: str):
+    db_exec(
+        "UPDATE usuarios SET senha_hash=:s, token_reset=NULL, token_reset_expira=NULL WHERE nome=:n",
+        {"s": _hash_senha(nova_senha), "n": nome}
+    )
+
+def _enviar_email(dest: str, assunto: str, corpo_html: str) -> bool:
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = assunto
+        msg["From"]    = st.secrets["EMAIL_USER"]
+        msg["To"]      = dest
+        msg.attach(MIMEText(corpo_html, "html"))
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as srv:
+            srv.login(st.secrets["EMAIL_USER"], st.secrets["EMAIL_PASSWORD"])
+            srv.sendmail(st.secrets["EMAIL_USER"], dest, msg.as_string())
+        return True
+    except Exception:
+        return False
+
+def enviar_verificacao(email: str, token: str) -> bool:
+    corpo = f"""
+    <div style="font-family:sans-serif;max-width:420px;margin:0 auto;padding:24px">
+      <h2 style="color:#7c3aed">💜 Controle Financeiro</h2>
+      <p>Seu código de verificação é:</p>
+      <div style="font-size:38px;font-weight:bold;letter-spacing:10px;color:#7c3aed;
+                  padding:20px;background:#f5f3ff;border-radius:10px;text-align:center">
+        {token}
+      </div>
+      <p style="color:#888;font-size:12px;margin-top:16px">
+        Válido por 15 minutos. Ignore se não criou uma conta.
+      </p>
+    </div>"""
+    return _enviar_email(email, "Código de verificação — Controle Financeiro", corpo)
+
+def enviar_reset(email: str, token: str) -> bool:
+    corpo = f"""
+    <div style="font-family:sans-serif;max-width:420px;margin:0 auto;padding:24px">
+      <h2 style="color:#7c3aed">💜 Controle Financeiro</h2>
+      <p>Seu código para redefinir a senha é:</p>
+      <div style="font-size:38px;font-weight:bold;letter-spacing:10px;color:#7c3aed;
+                  padding:20px;background:#f5f3ff;border-radius:10px;text-align:center">
+        {token}
+      </div>
+      <p style="color:#888;font-size:12px;margin-top:16px">
+        Válido por 15 minutos. Ignore se não solicitou redefinição de senha.
+      </p>
+    </div>"""
+    return _enviar_email(email, "Redefinir senha — Controle Financeiro", corpo)
 
 # ── Rules per user ────────────────────────────────────────────────────────────
 @st.cache_data
@@ -633,38 +819,249 @@ def brl(v: float) -> str:
     return f"-{s}" if v < 0 else s
 
 # ── Login ─────────────────────────────────────────────────────────────────────
+def _forca_senha(senha: str):
+    score = 0
+    if len(senha) >= 8:  score += 1
+    if len(senha) >= 12: score += 1
+    if re.search(r'[A-Z]', senha): score += 1
+    if re.search(r'[a-z]', senha): score += 1
+    if re.search(r'\d',    senha): score += 1
+    if re.search(r'[^A-Za-z0-9]', senha): score += 1
+    if score <= 2: return score, "Fraca",  "#ef4444"
+    if score <= 4: return score, "Média",  "#f59e0b"
+    return score, "Forte", "#22c55e"
+
+def _barra_forca(senha: str, mostrar_dicas: bool = False):
+    score, label, color = _forca_senha(senha)
+    pct = int(score / 6 * 100)
+    dicas = []
+    if mostrar_dicas:
+        if len(senha) < 8:              dicas.append("8+ caracteres")
+        if not re.search(r'[A-Z]', senha): dicas.append("maiúscula")
+        if not re.search(r'\d',    senha): dicas.append("número")
+        if not re.search(r'[^A-Za-z0-9]', senha): dicas.append("símbolo")
+    extra = f" — falta: {', '.join(dicas)}" if dicas else (" ✓" if score >= 5 else "")
+    st.markdown(f"""<div style="margin:-8px 0 10px">
+      <div style="background:#e2e8f0;border-radius:4px;height:6px">
+        <div style="background:{color};width:{pct}%;height:6px;border-radius:4px;transition:width .3s"></div>
+      </div>
+      <div style="font-size:12px;color:{color};margin-top:3px">Força: <b>{label}</b>{extra}</div>
+    </div>""", unsafe_allow_html=True)
+
 def render_login():
     _, col, _ = st.columns([1, 1.5, 1])
+    estado = st.session_state.get("auth_estado")
+
     with col:
         st.markdown("## 💜 Controle Financeiro")
         st.markdown("---")
-        modo = st.radio("", ["Entrar", "Criar conta"], horizontal=True, label_visibility="collapsed")
-        nome = st.text_input("Usuário", placeholder="ex: arthur")
-        pin  = st.text_input("PIN (4 dígitos)", type="password", max_chars=4, placeholder="••••")
 
+        # ── Verificação de e-mail pós-cadastro ──────────────────────────────
+        if estado == "verificando_email":
+            nome  = st.session_state.get("auth_usuario_pendente", "")
+            email = st.session_state.get("auth_email_pendente", "")
+            st.info(f"📧 Código enviado para **{email}**. Verifique sua caixa de entrada.")
+            with st.form("form_verif"):
+                codigo = st.text_input("Código de 6 dígitos", max_chars=6, placeholder="000000")
+                c1, c2 = st.columns(2)
+                with c1:
+                    verificar = st.form_submit_button("Verificar →", type="primary", use_container_width=True)
+                with c2:
+                    reenviar = st.form_submit_button("Reenviar", use_container_width=True)
+            if verificar:
+                if verificar_token_email(nome, codigo.strip()):
+                    _resetar_falhas(nome)
+                    _registrar_acesso(nome)
+                    st.session_state["usuario"] = nome
+                    for k in ["auth_estado", "auth_usuario_pendente", "auth_email_pendente"]:
+                        st.session_state.pop(k, None)
+                    st.rerun()
+                else:
+                    st.error("Código inválido. Tente novamente.")
+            if reenviar:
+                user = get_user(nome)
+                if user and user.get("email"):
+                    token = _gerar_token()
+                    db_exec("UPDATE usuarios SET token_verificacao=:t WHERE nome=:n",
+                            {"t": token, "n": nome})
+                    enviar_verificacao(user["email"], token)
+                    st.success("Código reenviado!")
+            if st.button("← Voltar", use_container_width=True):
+                for k in ["auth_estado", "auth_usuario_pendente", "auth_email_pendente"]:
+                    st.session_state.pop(k, None)
+                st.rerun()
+            return
+
+        # ── Upgrade de PIN legado → nova senha ──────────────────────────────
+        if estado == "upgrade_legacy":
+            nome = st.session_state.get("auth_usuario_pendente", "")
+            st.success(f"Bem-vindo de volta, **{nome}**!")
+            st.warning("Por segurança, crie uma nova senha para sua conta.")
+            st.caption("Requisitos: mínimo 8 caracteres, pelo menos uma letra e um número.")
+            with st.form("form_upgrade"):
+                nova = st.text_input("Nova senha", type="password", placeholder="Mínimo 8 caracteres")
+                conf = st.text_input("Confirmar senha", type="password")
+                confirmar = st.form_submit_button("Confirmar →", type="primary", use_container_width=True)
+            if confirmar:
+                if len(nova) < 8:
+                    st.error("A senha deve ter pelo menos 8 caracteres.")
+                    _barra_forca(nova)
+                elif not re.search(r'[A-Za-z]', nova):
+                    st.error("A senha deve conter pelo menos uma letra.")
+                elif nova != conf:
+                    st.error("As senhas não coincidem.")
+                else:
+                    upgrade_legacy_user(nome, nova)
+                    _registrar_acesso(nome)
+                    st.session_state["usuario"] = nome
+                    for k in ["auth_estado", "auth_usuario_pendente"]:
+                        st.session_state.pop(k, None)
+                    st.rerun()
+            return
+
+        # ── Reset de senha — código + nova senha ────────────────────────────
+        if estado == "reset_codigo":
+            nome  = st.session_state.get("auth_reset_nome", "")
+            email = st.session_state.get("auth_reset_email", "")
+            st.info(f"📧 Código enviado para **{email}**.")
+            st.caption("Requisitos: mínimo 8 caracteres, pelo menos uma letra e um número.")
+            with st.form("form_reset"):
+                codigo = st.text_input("Código de 6 dígitos", max_chars=6, placeholder="000000")
+                nova   = st.text_input("Nova senha", type="password", placeholder="Mínimo 8 caracteres")
+                conf   = st.text_input("Confirmar nova senha", type="password")
+                redefinir = st.form_submit_button("Redefinir senha →", type="primary", use_container_width=True)
+            if redefinir:
+                if not verificar_token_reset(nome, codigo.strip()):
+                    st.error("Código inválido ou expirado.")
+                elif len(nova) < 8:
+                    st.error("A senha deve ter pelo menos 8 caracteres.")
+                    _barra_forca(nova)
+                elif nova != conf:
+                    st.error("As senhas não coincidem.")
+                else:
+                    alterar_senha(nome, nova)
+                    for k in ["auth_estado", "auth_reset_nome", "auth_reset_email"]:
+                        st.session_state.pop(k, None)
+                    st.success("Senha redefinida com sucesso! Faça login.")
+                    st.rerun()
+            if st.button("← Voltar", use_container_width=True):
+                for k in ["auth_estado", "auth_reset_nome", "auth_reset_email"]:
+                    st.session_state.pop(k, None)
+                st.rerun()
+            return
+
+        # ── Tela principal ───────────────────────────────────────────────────
+        modo = st.radio("", ["Entrar", "Criar conta", "Esqueci a senha"],
+                        horizontal=True, label_visibility="collapsed")
+
+        # ENTRAR
         if modo == "Entrar":
-            if st.button("Entrar →", type="primary", use_container_width=True):
-                if not nome or not pin:
-                    st.error("Preencha usuário e PIN.")
+            with st.form("form_entrar"):
+                nome  = st.text_input("Usuário", placeholder="ex: arthur")
+                senha = st.text_input("Senha", type="password")
+                entrar = st.form_submit_button("Entrar →", type="primary", use_container_width=True)
+            if entrar:
+                if not nome or not senha:
+                    st.error("Preencha usuário e senha.")
                 elif not user_exists(nome):
                     st.error("Usuário não encontrado.")
-                elif not verify_pin(nome, pin):
-                    st.error("PIN incorreto.")
                 else:
-                    st.session_state["usuario"] = nome
-                    st.rerun()
-        else:
-            if st.button("Criar conta →", type="primary", use_container_width=True):
+                    bloqueado, mins = _check_bloqueio(nome)
+                    if bloqueado:
+                        st.error(f"🔒 Conta bloqueada. Tente novamente em **{mins} minuto(s)**.")
+                    else:
+                        ok, is_legacy = verify_credenciais(nome, senha)
+                        if not ok:
+                            _registrar_falha(nome)
+                            bloqueado2, _ = _check_bloqueio(nome)
+                            if bloqueado2:
+                                st.error(f"🔒 Conta bloqueada por {_BLOQUEIO_MINUTOS} minutos após múltiplas tentativas.")
+                            else:
+                                user = get_user(nome)
+                                tentativas = user.get("tentativas", 0) if user else 0
+                                restantes  = _MAX_TENTATIVAS - tentativas
+                                st.error(f"Senha incorreta. {restantes} tentativa(s) restante(s).")
+                        elif is_legacy:
+                            _resetar_falhas(nome)
+                            st.session_state["auth_estado"] = "upgrade_legacy"
+                            st.session_state["auth_usuario_pendente"] = nome
+                            st.rerun()
+                        else:
+                            user = get_user(nome)
+                            if user and not user.get("email_verificado", True):
+                                st.session_state["auth_estado"] = "verificando_email"
+                                st.session_state["auth_usuario_pendente"] = nome
+                                st.session_state["auth_email_pendente"] = user.get("email", "")
+                                st.rerun()
+                            else:
+                                ult = user.get("ultimo_acesso") if user else None
+                                _resetar_falhas(nome)
+                                _registrar_acesso(nome)
+                                st.session_state["usuario"] = nome
+                                if ult:
+                                    st.session_state["_ultimo_acesso"] = ult
+                                st.rerun()
+
+        # CRIAR CONTA
+        elif modo == "Criar conta":
+            st.caption("Requisitos de senha: 8+ caracteres, pelo menos uma letra e um número.")
+            with st.form("form_cadastro"):
+                nome  = st.text_input("Usuário", placeholder="ex: maria")
+                email = st.text_input("E-mail", placeholder="seu@email.com")
+                senha = st.text_input("Senha", type="password", placeholder="Mínimo 8 caracteres")
+                conf  = st.text_input("Confirmar senha", type="password")
+                criar = st.form_submit_button("Criar conta →", type="primary", use_container_width=True)
+            if criar:
                 if not nome:
                     st.error("Digite um nome de usuário.")
-                elif len(pin) != 4 or not pin.isdigit():
-                    st.error("PIN deve ter 4 dígitos numéricos.")
+                elif len(nome) < 3:
+                    st.error("Usuário deve ter pelo menos 3 caracteres.")
+                elif email and not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
+                    st.error("E-mail inválido.")
+                elif len(senha) < 8:
+                    st.error("A senha deve ter pelo menos 8 caracteres.")
+                    _barra_forca(senha)
+                elif not re.search(r'[A-Za-z]', senha):
+                    st.error("A senha deve conter pelo menos uma letra.")
+                elif senha != conf:
+                    st.error("As senhas não coincidem.")
                 elif user_exists(nome):
                     st.error("Usuário já existe. Escolha outro nome.")
                 else:
-                    create_user(nome, pin)
-                    st.session_state["usuario"] = nome
-                    st.rerun()
+                    token = create_user(nome, senha, email)
+                    if token and email and _has_email_config():
+                        enviar_verificacao(email, token)
+                        st.session_state["auth_estado"] = "verificando_email"
+                        st.session_state["auth_usuario_pendente"] = nome
+                        st.session_state["auth_email_pendente"] = email
+                        st.rerun()
+                    else:
+                        _registrar_acesso(nome)
+                        st.session_state["usuario"] = nome
+                        st.rerun()
+
+        # ESQUECI A SENHA
+        else:
+            if not _has_email_config():
+                st.warning("Recuperação de senha por e-mail não está configurada neste momento.")
+            else:
+                with st.form("form_esqueci"):
+                    email  = st.text_input("E-mail cadastrado", placeholder="seu@email.com")
+                    enviar = st.form_submit_button("Enviar código →", type="primary", use_container_width=True)
+                if enviar:
+                    if not email:
+                        st.error("Digite seu e-mail.")
+                    else:
+                        resultado = solicitar_reset(email)
+                        if resultado:
+                            nome_r, token_r = resultado
+                            enviar_reset(email, token_r)
+                            st.session_state["auth_estado"] = "reset_codigo"
+                            st.session_state["auth_reset_nome"]  = nome_r
+                            st.session_state["auth_reset_email"] = email
+                            st.rerun()
+                        else:
+                            st.success("Se o e-mail estiver cadastrado, você receberá um código em breve.")
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
@@ -1861,6 +2258,7 @@ def inject_mobile_css():
 def main():
     db_init()
     _migrar_rendas()
+    _migrar_auth()
     inject_mobile_css()
 
     # Fix de teclado no ag-grid SelectboxColumn no mobile (bug 5)
@@ -1890,6 +2288,10 @@ def main():
         return
 
     usuario = st.session_state["usuario"]
+
+    if "_ultimo_acesso" in st.session_state:
+        ult = st.session_state.pop("_ultimo_acesso")
+        st.toast(f"Último acesso: {ult}", icon="🕐")
 
     # Carregar regras e categorias ANTES da sidebar para que checkboxes incluam cats customizadas
     rules = load_rules(usuario)
