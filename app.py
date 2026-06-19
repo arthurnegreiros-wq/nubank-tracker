@@ -174,6 +174,14 @@ def user_exists(nome: str) -> bool:
     rows, _ = db_exec("SELECT 1 FROM usuarios WHERE nome=:n", {"n": nome}, fetch=True)
     return bool(rows)
 
+def resolve_login(login: str):
+    """Resolve usuário ou e-mail → nome de usuário, ou None se não encontrado."""
+    login = login.strip()
+    if "@" in login:
+        rows, _ = db_exec("SELECT nome FROM usuarios WHERE email=:e", {"e": login}, fetch=True)
+        return rows[0][0] if rows else None
+    return login if user_exists(login) else None
+
 def get_user(nome: str):
     rows, cols = db_exec("SELECT * FROM usuarios WHERE nome=:n", {"n": nome}, fetch=True)
     return dict(zip(cols, rows[0])) if rows else None
@@ -849,6 +857,43 @@ def _barra_forca(senha: str, mostrar_dicas: bool = False):
     </div>""", unsafe_allow_html=True)
 
 def render_login():
+    # CSS: transforma o form_submit_button secundário em link de texto
+    st.markdown("""<style>
+    button[kind="secondaryFormSubmit"] {
+        background: none !important;
+        border: none !important;
+        color: #9966cc !important;
+        padding: 0 !important;
+        box-shadow: none !important;
+        text-decoration: underline !important;
+        font-size: 0.8rem !important;
+        min-height: 0 !important;
+        height: auto !important;
+        line-height: 1.4 !important;
+        white-space: nowrap !important;
+    }
+    button[kind="secondaryFormSubmit"]:hover {
+        background: none !important;
+        border: none !important;
+        color: #7c3aed !important;
+    }
+    button[kind="secondaryFormSubmit"] p {
+        font-size: 0.8rem !important;
+        margin: 0 !important;
+    }
+    /* Reordena visualmente: Esqueci acima do Entrar, mas Entrar vem primeiro no DOM (Enter = login) */
+    div[data-testid="stForm"] > div {
+        display: flex !important;
+        flex-direction: column !important;
+    }
+    div[data-testid="stFormSubmitButton"]:has(button[kind="primaryFormSubmit"]) {
+        order: 2;
+    }
+    div[data-testid="stFormSubmitButton"]:has(button[kind="secondaryFormSubmit"]) {
+        order: 1;
+    }
+    </style>""", unsafe_allow_html=True)
+
     _, col, _ = st.columns([1, 1.5, 1])
     estado = st.session_state.get("auth_estado")
 
@@ -950,98 +995,9 @@ def render_login():
                 st.rerun()
             return
 
-        # ── Tela principal ───────────────────────────────────────────────────
-        modo = st.radio("", ["Entrar", "Criar conta", "Esqueci a senha"],
-                        horizontal=True, label_visibility="collapsed")
-
-        # ENTRAR
-        if modo == "Entrar":
-            with st.form("form_entrar"):
-                nome  = st.text_input("Usuário", placeholder="ex: arthur")
-                senha = st.text_input("Senha", type="password")
-                entrar = st.form_submit_button("Entrar →", type="primary", use_container_width=True)
-            if entrar:
-                if not nome or not senha:
-                    st.error("Preencha usuário e senha.")
-                elif not user_exists(nome):
-                    st.error("Usuário não encontrado.")
-                else:
-                    bloqueado, mins = _check_bloqueio(nome)
-                    if bloqueado:
-                        st.error(f"🔒 Conta bloqueada. Tente novamente em **{mins} minuto(s)**.")
-                    else:
-                        ok, is_legacy = verify_credenciais(nome, senha)
-                        if not ok:
-                            _registrar_falha(nome)
-                            bloqueado2, _ = _check_bloqueio(nome)
-                            if bloqueado2:
-                                st.error(f"🔒 Conta bloqueada por {_BLOQUEIO_MINUTOS} minutos após múltiplas tentativas.")
-                            else:
-                                user = get_user(nome)
-                                tentativas = user.get("tentativas", 0) if user else 0
-                                restantes  = _MAX_TENTATIVAS - tentativas
-                                st.error(f"Senha incorreta. {restantes} tentativa(s) restante(s).")
-                        elif is_legacy:
-                            _resetar_falhas(nome)
-                            st.session_state["auth_estado"] = "upgrade_legacy"
-                            st.session_state["auth_usuario_pendente"] = nome
-                            st.rerun()
-                        else:
-                            user = get_user(nome)
-                            if user and not user.get("email_verificado", True):
-                                st.session_state["auth_estado"] = "verificando_email"
-                                st.session_state["auth_usuario_pendente"] = nome
-                                st.session_state["auth_email_pendente"] = user.get("email", "")
-                                st.rerun()
-                            else:
-                                ult = user.get("ultimo_acesso") if user else None
-                                _resetar_falhas(nome)
-                                _registrar_acesso(nome)
-                                st.session_state["usuario"] = nome
-                                if ult:
-                                    st.session_state["_ultimo_acesso"] = ult
-                                st.rerun()
-
-        # CRIAR CONTA
-        elif modo == "Criar conta":
-            st.caption("Requisitos de senha: 8+ caracteres, pelo menos uma letra e um número.")
-            with st.form("form_cadastro"):
-                nome  = st.text_input("Usuário", placeholder="ex: maria")
-                email = st.text_input("E-mail", placeholder="seu@email.com")
-                senha = st.text_input("Senha", type="password", placeholder="Mínimo 8 caracteres")
-                conf  = st.text_input("Confirmar senha", type="password")
-                criar = st.form_submit_button("Criar conta →", type="primary", use_container_width=True)
-            if criar:
-                if not nome:
-                    st.error("Digite um nome de usuário.")
-                elif len(nome) < 3:
-                    st.error("Usuário deve ter pelo menos 3 caracteres.")
-                elif email and not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
-                    st.error("E-mail inválido.")
-                elif len(senha) < 8:
-                    st.error("A senha deve ter pelo menos 8 caracteres.")
-                    _barra_forca(senha)
-                elif not re.search(r'[A-Za-z]', senha):
-                    st.error("A senha deve conter pelo menos uma letra.")
-                elif senha != conf:
-                    st.error("As senhas não coincidem.")
-                elif user_exists(nome):
-                    st.error("Usuário já existe. Escolha outro nome.")
-                else:
-                    token = create_user(nome, senha, email)
-                    if token and email and _has_email_config():
-                        enviar_verificacao(email, token)
-                        st.session_state["auth_estado"] = "verificando_email"
-                        st.session_state["auth_usuario_pendente"] = nome
-                        st.session_state["auth_email_pendente"] = email
-                        st.rerun()
-                    else:
-                        _registrar_acesso(nome)
-                        st.session_state["usuario"] = nome
-                        st.rerun()
-
-        # ESQUECI A SENHA
-        else:
+        # ── Esqueci a senha ──────────────────────────────────────────────────
+        if estado == "esqueci":
+            st.markdown("### Redefinir senha")
             if not _has_email_config():
                 st.warning("Recuperação de senha por e-mail não está configurada neste momento.")
             else:
@@ -1062,6 +1018,113 @@ def render_login():
                             st.rerun()
                         else:
                             st.success("Se o e-mail estiver cadastrado, você receberá um código em breve.")
+            if st.button("← Voltar ao login", use_container_width=True):
+                st.session_state.pop("auth_estado", None)
+                st.rerun()
+            return
+
+        # ── Tela principal ───────────────────────────────────────────────────
+        modo = st.radio("", ["Entrar", "Criar conta"],
+                        horizontal=True, label_visibility="collapsed")
+
+        # ENTRAR
+        if modo == "Entrar":
+            with st.form("form_entrar"):
+                login = st.text_input("Usuário ou e-mail", placeholder="ex: arthur ou seu@email.com")
+                senha = st.text_input("Senha", type="password")
+                entrar = st.form_submit_button("Entrar →", type="primary", use_container_width=True)
+                esqueci = st.form_submit_button("Esqueci minha senha")
+
+            if esqueci:
+                st.session_state["auth_estado"] = "esqueci"
+                st.rerun()
+
+            if entrar:
+                if not login or not senha:
+                    st.error("Preencha usuário/e-mail e senha.")
+                else:
+                    nome = resolve_login(login)
+                    if nome is None:
+                        st.error("Usuário ou e-mail não encontrado.")
+                    else:
+                        bloqueado, mins = _check_bloqueio(nome)
+                        if bloqueado:
+                            st.error(f"🔒 Conta bloqueada. Tente novamente em **{mins} minuto(s)**.")
+                        else:
+                            ok, is_legacy = verify_credenciais(nome, senha)
+                            if not ok:
+                                _registrar_falha(nome)
+                                bloqueado2, _ = _check_bloqueio(nome)
+                                if bloqueado2:
+                                    st.error(f"🔒 Conta bloqueada por {_BLOQUEIO_MINUTOS} minutos após múltiplas tentativas.")
+                                else:
+                                    user = get_user(nome)
+                                    tentativas = user.get("tentativas", 0) if user else 0
+                                    restantes  = _MAX_TENTATIVAS - tentativas
+                                    st.error(f"Senha incorreta. {restantes} tentativa(s) restante(s).")
+                            elif is_legacy:
+                                _resetar_falhas(nome)
+                                st.session_state["auth_estado"] = "upgrade_legacy"
+                                st.session_state["auth_usuario_pendente"] = nome
+                                st.rerun()
+                            else:
+                                user = get_user(nome)
+                                if user and not user.get("email_verificado", True):
+                                    st.session_state["auth_estado"] = "verificando_email"
+                                    st.session_state["auth_usuario_pendente"] = nome
+                                    st.session_state["auth_email_pendente"] = user.get("email", "")
+                                    st.rerun()
+                                else:
+                                    ult = user.get("ultimo_acesso") if user else None
+                                    _resetar_falhas(nome)
+                                    _registrar_acesso(nome)
+                                    st.session_state["usuario"] = nome
+                                    if ult:
+                                        st.session_state["_ultimo_acesso"] = ult
+                                    st.rerun()
+
+        # CRIAR CONTA
+        else:
+            st.caption("Requisitos de senha: 8+ caracteres, pelo menos uma letra e um número.")
+            with st.form("form_cadastro"):
+                nome       = st.text_input("Usuário", placeholder="ex: maria")
+                email      = st.text_input("E-mail", placeholder="seu@email.com")
+                email_conf = st.text_input("Confirmar e-mail", placeholder="repita o e-mail")
+                senha      = st.text_input("Senha", type="password", placeholder="Mínimo 8 caracteres")
+                conf       = st.text_input("Confirmar senha", type="password")
+                criar = st.form_submit_button("Criar conta →", type="primary", use_container_width=True)
+            if criar:
+                if not nome:
+                    st.error("Digite um nome de usuário.")
+                elif len(nome) < 3:
+                    st.error("Usuário deve ter pelo menos 3 caracteres.")
+                elif not email:
+                    st.error("O e-mail é obrigatório.")
+                elif not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
+                    st.error("E-mail inválido.")
+                elif email != email_conf:
+                    st.error("Os e-mails não coincidem.")
+                elif len(senha) < 8:
+                    st.error("A senha deve ter pelo menos 8 caracteres.")
+                    _barra_forca(senha)
+                elif not re.search(r'[A-Za-z]', senha):
+                    st.error("A senha deve conter pelo menos uma letra.")
+                elif senha != conf:
+                    st.error("As senhas não coincidem.")
+                elif user_exists(nome):
+                    st.error("Usuário já existe. Escolha outro nome.")
+                else:
+                    token = create_user(nome, senha, email)
+                    if token and _has_email_config():
+                        enviar_verificacao(email, token)
+                        st.session_state["auth_estado"] = "verificando_email"
+                        st.session_state["auth_usuario_pendente"] = nome
+                        st.session_state["auth_email_pendente"] = email
+                        st.rerun()
+                    else:
+                        _registrar_acesso(nome)
+                        st.session_state["usuario"] = nome
+                        st.rerun()
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
@@ -1070,26 +1133,44 @@ def render_dashboard(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: list,
     view = df_all[mask & ~df_all["categoria"].isin(cats_excluir)].copy()
     view["tipo"] = view["descricao"].map(get_tipo)
 
+    # entradas computadas antes do filtro de tipo (sempre o total real)
+    entradas_view = view[view["valor"] > 0].copy()
+    entradas = entradas_view["valor"].sum()
+    saidas   = view[view["valor"] < 0]["valor"].sum()
+
     tipo_sel = st.radio(
-        "Tipo de pagamento",
-        ["Todos", "Pix Enviado", "Débito", "Boleto", "Pix Recebido", "Fatura Cartão", "RDB"],
+        "Filtrar despesas",
+        ["Todos", "Pix Enviado", "Débito", "Boleto", "Fatura Cartão", "RDB"],
         horizontal=True, key="tipo_filter",
     )
-    if tipo_sel != "Todos":
-        view = view[view["tipo"] == tipo_sel]
-        if view.empty:
-            st.warning(f"Nenhuma transação do tipo **{tipo_sel}** no período selecionado.")
 
     st.divider()
-    entradas = view[view["valor"] > 0]["valor"].sum()
-    saidas   = view[view["valor"] < 0]["valor"].sum()
     c1, c2, c3 = st.columns(3)
     c1.metric("💰 Entradas", brl(entradas))
     c2.metric("💸 Saídas",   brl(saidas))
     c3.metric("📊 Saldo",    brl(entradas + saidas))
     st.divider()
 
+    # ── Receitas do mês ───────────────────────────────────────────────────────
+    if not entradas_view.empty:
+        with st.expander(f"💰 Receitas deste mês — {brl(entradas)}"):
+            by_r = (
+                entradas_view.groupby("categoria")["valor"]
+                .agg(["sum", "count"])
+                .reset_index()
+                .rename(columns={"categoria": "Categoria", "sum": "Total", "count": "Qtd"})
+                .sort_values("Total", ascending=False)
+                .reset_index(drop=True)
+            )
+            by_r["Total"] = by_r["Total"].map(brl)
+            st.dataframe(by_r, hide_index=True, use_container_width=True)
+            st.caption("Para categorizar entradas individualmente, acesse a aba **💰 Receitas** na seção Transações abaixo.")
+
     gastos = view[view["valor"] < 0].copy()
+    if tipo_sel != "Todos":
+        gastos = gastos[gastos["tipo"] == tipo_sel]
+        if gastos.empty:
+            st.warning(f"Nenhuma despesa do tipo **{tipo_sel}** no período selecionado.")
     gastos["abs"] = gastos["valor"].abs()
 
     _chart_cfg = {"scrollZoom": False, "displayModeBar": False}
@@ -1438,90 +1519,113 @@ def render_tx_fragment(df_all: pd.DataFrame, periodo_sel: str, cats_excluir: lis
     view = df_all[mask & ~df_all["categoria"].isin(cats_excluir)].copy()
     view["tipo"] = view["descricao"].map(get_tipo)
     tipo_sel = st.session_state.get("tipo_filter", "Todos")
-    if tipo_sel != "Todos":
-        view = view[view["tipo"] == tipo_sel]
 
     st.divider()
     st.subheader("Transações")
     busca = st.text_input("🔍 Buscar", placeholder="ex: uber, ifood, farmácia...")
 
-    tbl = view[["uid", "data", "valor", "descricao", "categoria", "tipo"]].sort_values("data", ascending=False).reset_index(drop=True)
-    if busca:
-        tbl = tbl[tbl["descricao"].str.contains(busca, case=False, na=False)].reset_index(drop=True)
+    def _build_editor(df_view: pd.DataFrame, key: str):
+        tbl = df_view[["uid", "data", "valor", "descricao", "categoria", "tipo"]]\
+            .sort_values("data", ascending=False).reset_index(drop=True)
+        uid_index        = tbl["uid"].copy()
+        tbl["data"]      = tbl["data"].dt.strftime("%d/%m/%Y")
+        tbl["valor"]     = tbl["valor"].map(brl)
+        tbl["descricao"] = tbl["descricao"].map(extract_merchant)
+        tbl["sel"]       = False
+        tbl = tbl.rename(columns={"sel": "✓", "data": "Data", "valor": "Valor",
+                                   "descricao": "Descrição", "categoria": "Categoria", "tipo": "Tipo"})
+        tbl["Categoria ✏️"] = tbl["Categoria"]
+        cat_orig = tbl["Categoria ✏️"].reset_index(drop=True)
+        edited = st.data_editor(
+            tbl[["✓", "Data", "Valor", "Tipo", "Descrição", "Categoria ✏️"]],
+            column_config={
+                "✓":             st.column_config.CheckboxColumn("✓", width="small"),
+                "Data":          st.column_config.Column(disabled=True),
+                "Valor":         st.column_config.Column(disabled=True),
+                "Tipo":          st.column_config.Column(disabled=True, width="small"),
+                "Descrição":     st.column_config.Column(disabled=True),
+                "Categoria ✏️":  st.column_config.SelectboxColumn("Categoria ✏️", options=user_cats, required=True),
+            },
+            hide_index=True, use_container_width=True, key=key,
+        )
+        return uid_index, edited, cat_orig
 
-    uid_index        = tbl["uid"].copy()
-    tbl["data"]      = tbl["data"].dt.strftime("%d/%m/%Y")
-    tbl["valor"]     = tbl["valor"].map(brl)
-    tbl["descricao"] = tbl["descricao"].map(extract_merchant)
-    tbl["sel"]       = False
-    tbl = tbl.rename(columns={"sel": "✓", "data": "Data", "valor": "Valor",
-                               "descricao": "Descrição", "categoria": "Categoria", "tipo": "Tipo"})
-    tbl["Categoria ✏️"] = tbl["Categoria"]
+    def _handle_actions(uid_index, edited, cat_orig, key: str):
+        cat_edited   = edited["Categoria ✏️"].reset_index(drop=True)
+        pending_cats = {
+            uid_index.iloc[i]: cat_edited.iloc[i]
+            for i in range(len(cat_edited))
+            if cat_edited.iloc[i] != cat_orig.iloc[i]
+        }
+        selecionados = uid_index[edited[edited["✓"] == True].index].tolist()
 
-    edited = st.data_editor(
-        tbl[["✓", "Data", "Valor", "Tipo", "Descrição", "Categoria ✏️"]],
-        column_config={
-            "✓":          st.column_config.CheckboxColumn("✓", width="small"),
-            "Data":       st.column_config.Column(disabled=True),
-            "Valor":      st.column_config.Column(disabled=True),
-            "Tipo":       st.column_config.Column(disabled=True, width="small"),
-            "Descrição":  st.column_config.Column(disabled=True),
-            "Categoria ✏️": st.column_config.SelectboxColumn(
-                "Categoria ✏️", options=user_cats, required=True,
-            ),
-        },
-        hide_index=True, use_container_width=True, key="tx_editor",
-    )
-
-    cat_orig   = tbl["Categoria ✏️"].reset_index(drop=True)
-    cat_edited = edited["Categoria ✏️"].reset_index(drop=True)
-    pending_cats = {
-        uid_index.iloc[i]: cat_edited.iloc[i]
-        for i in range(len(cat_edited))
-        if cat_edited.iloc[i] != cat_orig.iloc[i]
-    }
-
-    selecionados = uid_index[edited[edited["✓"] == True].index].tolist()
-    n = len(selecionados)
-
-    if pending_cats:
-        ca, cb = st.columns([4, 1])
-        if ca.button(f"💾 Salvar {len(pending_cats)} categoria(s) alterada(s)", type="primary", use_container_width=True):
-            save_categorias(list(pending_cats.items()), usuario)
-            fetch_data.clear()
-            st.session_state.pop("tx_editor", None)
-            st.rerun(scope="app")
-        if cb.button("✕", use_container_width=True, help="Descartar alterações"):
-            st.session_state.pop("tx_editor", None)
-            st.rerun(scope="app")
-
-    if n > 0:
-        st.info(f"**{n} transação(ões) selecionada(s)**")
-        a1, a2, a3 = st.columns([3, 1, 1])
-        with a1:
-            cat_acao = st.selectbox("Definir categoria", user_cats, key="bulk_cat")
-        with a2:
-            if st.button("✅ Aplicar", use_container_width=True):
-                save_categorias([(uid, cat_acao) for uid in selecionados], usuario)
+        if pending_cats:
+            ca, cb = st.columns([4, 1])
+            if ca.button(f"💾 Salvar {len(pending_cats)} categoria(s)", type="primary",
+                         use_container_width=True, key=f"save_{key}"):
+                save_categorias(list(pending_cats.items()), usuario)
                 fetch_data.clear()
-                st.session_state.pop("tx_editor", None)
+                st.session_state.pop(key, None)
                 st.rerun(scope="app")
-        with a3:
-            if st.button("🚫 Ignorar", use_container_width=True):
-                save_categorias([(uid, "Ignorar") for uid in selecionados], usuario)
+            if cb.button("✕", use_container_width=True, help="Descartar", key=f"disc_{key}"):
+                st.session_state.pop(key, None)
+                st.rerun(scope="app")
+
+        if selecionados:
+            st.info(f"**{len(selecionados)} transação(ões) selecionada(s)**")
+            a1, a2, a3 = st.columns([3, 1, 1])
+            with a1:
+                cat_acao = st.selectbox("Definir categoria", user_cats, key=f"bulk_{key}")
+            with a2:
+                if st.button("✅ Aplicar", use_container_width=True, key=f"apply_{key}"):
+                    save_categorias([(uid, cat_acao) for uid in selecionados], usuario)
+                    fetch_data.clear()
+                    st.session_state.pop(key, None)
+                    st.rerun(scope="app")
+            with a3:
+                if st.button("🚫 Ignorar", use_container_width=True, key=f"ign_{key}"):
+                    save_categorias([(uid, "Ignorar") for uid in selecionados], usuario)
+                    fetch_data.clear()
+                    st.session_state.pop(key, None)
+                    st.rerun(scope="app")
+        elif not pending_cats:
+            st.caption("Clique em **Categoria ✏️** para mudar direto, ou marque ✓ para alterar várias de uma vez.")
+
+    tab_desp, tab_rec = st.tabs(["💸 Despesas", "💰 Receitas"])
+
+    # ── Despesas ──────────────────────────────────────────────────────────────
+    with tab_desp:
+        desp = view[view["valor"] < 0].copy()
+        if tipo_sel != "Todos":
+            desp = desp[desp["tipo"] == tipo_sel]
+        if busca:
+            desp = desp[desp["descricao"].str.contains(busca, case=False, na=False)]
+        if desp.empty:
+            st.info("Nenhuma despesa encontrada para os filtros selecionados.")
+        else:
+            uid_idx, edited, cat_orig = _build_editor(desp, "tx_editor")
+            _handle_actions(uid_idx, edited, cat_orig, "tx_editor")
+
+        if has_historico(usuario):
+            if st.button("↩️ Desfazer última alteração de categorias", key="undo_desp"):
+                n_revert = undo_last_tx(usuario)
                 fetch_data.clear()
-                st.session_state.pop("tx_editor", None)
+                st.success(f"{n_revert} transação(ões) revertida(s).")
                 st.rerun(scope="app")
-    elif not pending_cats:
-        st.caption("Clique em **Categoria ✏️** para mudar direto, ou marque ✓ para alterar várias de uma vez.")
 
-    if has_historico(usuario):
-        if st.button("↩️ Desfazer última alteração de categorias"):
-            n_revert = undo_last_tx(usuario)
-            fetch_data.clear()
-            st.success(f"{n_revert} transação(ões) revertida(s).")
-            st.rerun(scope="app")
+    # ── Receitas ──────────────────────────────────────────────────────────────
+    with tab_rec:
+        recp = view[view["valor"] > 0].copy()
+        if busca:
+            recp = recp[recp["descricao"].str.contains(busca, case=False, na=False)]
+        if recp.empty:
+            st.info("Nenhuma receita registrada neste período.")
+        else:
+            st.caption("Categorize suas entradas — ex: Salário, Reembolso, Pix Recebido…")
+            uid_idx_r, edited_r, cat_orig_r = _build_editor(recp, "tx_editor_rec")
+            _handle_actions(uid_idx_r, edited_r, cat_orig_r, "tx_editor_rec")
 
+    # ── Ignoradas ─────────────────────────────────────────────────────────────
     ignoradas = df_all[
         (df_all["data"].dt.to_period("M").astype(str) == periodo_sel) &
         (df_all["categoria"] == "Ignorar")
